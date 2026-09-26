@@ -28,14 +28,17 @@ def _conditional_token_logprobs(model, prompt_ids: torch.Tensor,
 
 def compute_counterfactual_logprobs(model, original_prompt_ids: torch.Tensor,
                                     counterfactual_prompt_ids: torch.Tensor,
-                                    generated_ids: torch.Tensor) -> dict:
+                                    generated_ids: torch.Tensor,
+                                    original_token_logprobs: torch.Tensor | None = None) -> dict:
     """Score the same generated sequence under original and altered prompts.
 
     Because each output position is causally masked, each subtoken's score is
     conditioned only on the prompt and the unchanged generated prefix before
     that subtoken, not on later generated tokens.
     """
-    original = _conditional_token_logprobs(model, original_prompt_ids, generated_ids)
+    original = original_token_logprobs
+    if original is None:
+        original = _conditional_token_logprobs(model, original_prompt_ids, generated_ids)
     counterfactual = _conditional_token_logprobs(
         model, counterfactual_prompt_ids, generated_ids
     )

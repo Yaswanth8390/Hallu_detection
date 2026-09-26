@@ -70,6 +70,38 @@ def content_word_groups(tokenizer, generated_ids, generated_text: str,
     return groups
 
 
+def _word_stem(word: str) -> str:
+    word = word.casefold()
+    for suffix in ("ing", "ed", "es", "s"):
+        if len(word) > len(suffix) + 3 and word.endswith(suffix):
+            return word[:-len(suffix)]
+    return word
+
+
+def find_evidence_span(question: str, generated_word: str) -> dict | None:
+    """Find a directly matching question span for a generated content word.
+
+    Matching is case-insensitive with a conservative English suffix fallback.
+    This is lexical evidence-span selection, not semantic entailment; callers
+    should leave the token unscored when no matching question span is found.
+    """
+    question_words = list(_WORD_PATTERN.finditer(question))
+    target = generated_word.casefold()
+    matches = [match for match in question_words if match.group().casefold() == target]
+    if not matches:
+        target_stem = _word_stem(target)
+        matches = [match for match in question_words
+                   if _word_stem(match.group()) == target_stem]
+    if not matches:
+        return None
+    match = matches[0]
+    return {
+        "text": match.group(),
+        "start": match.start(),
+        "end": match.end(),
+    }
+
+
 def classify_input_dependence(delta_logprob: float, threshold: float) -> str:
     """Classify prompt dependence without making a correctness judgment."""
     if delta_logprob >= threshold:

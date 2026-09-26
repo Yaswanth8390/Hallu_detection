@@ -4,7 +4,7 @@ import argparse
 import csv
 
 from dataset import load_truthfulqa
-from grounding import classify_input_dependence, content_word_groups
+from grounding import classify_input_dependence, content_word_groups, find_evidence_span
 from jacobian import compute_counterfactual_logprobs
 from model_utils import generate_answer, load_model
 
@@ -46,46 +46,69 @@ def main():
         )
         if generation.prompt.count(example.question) != 1:
             raise ValueError("Expected the question exactly once in the generation prompt")
-        counterfactual_prompt = generation.prompt.replace(example.question, "", 1)
-        counterfactual_prompt_ids = tokenizer(
-            counterfactual_prompt, return_tensors="pt"
-        ).input_ids[0]
-        token_logprobs = compute_counterfactual_logprobs(
-            model, generation.prompt_ids, counterfactual_prompt_ids,
+        original_scores = compute_counterfactual_logprobs(
+            model, generation.prompt_ids, generation.prompt_ids,
             generation.generated_ids,
-        )
+        )["original_token_logprobs"]
+        counterfactual_cache = {}
 
         for token_index, group in enumerate(word_groups):
+            evidence = find_evidence_span(example.question, group["token"])
             token_indices = group["token_indices"]
-            original_logprob = sum(
-                token_logprobs["original_token_logprobs"][index].item()
-                for index in token_indices
-            )
-            counterfactual_logprob = sum(
-                token_logprobs["counterfactual_token_logprobs"][index].item()
-                for index in token_indices
-            )
-            delta_logprob = original_logprob - counterfactual_logprob
+            original_logprob = sum(original_scores[index].item() for index in token_indices)
+            counterfactual_logprob = ""
+            delta_logprob = ""
+            if evidence is not None:
+                span_key = (evidence["start"], evidence["end"])
+                if span_key not in counterfactual_cache:
+                    counterfactual_question = (
+                        example.question[:evidence["start"]]
+                        + example.question[evidence["end"]:]
+                    )
+                    counterfactual_prompt = generation.prompt.replace(
+                        example.question, counterfactual_question, 1
+                    )
+                    counterfactual_prompt_ids = tokenizer(
+                        counterfactual_prompt, return_tensors="pt"
+                    ).input_ids[0]
+                    counterfactual_cache[span_key] = compute_counterfactual_logprobs(
+                        model, generation.prompt_ids, counterfactual_prompt_ids,
+                        generation.generated_ids,
+                        original_token_logprobs=original_scores,
+                    )["counterfactual_token_logprobs"]
+                counterfactual_scores = counterfactual_cache[span_key]
+                counterfactual_logprob = sum(
+                    counterfactual_scores[index].item() for index in token_indices
+                )
+                delta_logprob = original_logprob - counterfactual_logprob
+                classification = classify_input_dependence(
+                    delta_logprob, args.dependence_threshold
+                )
+                evidence_text = evidence["text"]
+                counterfactual_change = f"removed:{evidence_text}"
+            else:
+                classification = "no_matching_evidence_span"
+                evidence_text = ""
+                counterfactual_change = "not_scored_no_span"
+
             token_rows.append({
                 "question": example.question,
                 "generated_text": generation.generated_text,
                 "token_index_in_answer": token_index,
                 "token": group["token"],
                 "subtoken_count": group["subtoken_count"],
-                "evidence_span": example.question,
-                "counterfactual_change": "question_text_removed",
+                "evidence_span": evidence_text,
+                "counterfactual_change": counterfactual_change,
                 "original_logprob": original_logprob,
                 "counterfactual_logprob": counterfactual_logprob,
                 "delta_logprob": delta_logprob,
-                "classification": classify_input_dependence(
-                    delta_logprob, args.dependence_threshold
-                ),
+                "classification": classification,
                 "dependence_threshold": args.dependence_threshold,
             })
 
             print(f"[{example_index}/{len(examples)}] {group['token']!r}: "
-                  f"delta_logprob={delta_logprob:+.4f} "
-                  f"({token_index + 1}/{len(word_groups)})", flush=True)
+                  f"evidence={evidence_text!r} delta_logprob={delta_logprob} "
+                  f"classification={classification}", flush=True)
 
     def write_csv(path):
         if not token_rows:

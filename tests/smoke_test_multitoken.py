@@ -6,7 +6,11 @@ import io
 import torch
 from transformers import AutoModelForCausalLM, Qwen2Config
 
-from grounding import classify_input_dependence, content_word_groups
+from grounding import (
+    classify_input_dependence,
+    content_word_groups,
+    find_evidence_span,
+)
 from jacobian import compute_counterfactual_logprobs
 
 
@@ -45,6 +49,14 @@ assert [group["token"] for group in groups] == ["Internationalization", "42"]
 assert groups[0]["token_indices"] == [1, 2]
 assert groups[0]["subtoken_count"] == 2
 assert groups[1]["token_indices"] == [3]
+first_evidence = find_evidence_span(sentence, groups[0]["token"])
+number_evidence = find_evidence_span(sentence, groups[1]["token"])
+assert first_evidence["text"] == "Internationalization"
+assert number_evidence["text"] == "42"
+assert find_evidence_span("Who wrote 1984?", "Orwell") is None
+assert find_evidence_span("How many seeds?", "seed")["text"] == "seeds"
+assert (sentence[:first_evidence["start"]] + sentence[first_evidence["end"]:]
+    == "The  42.")
 
 logprobs = compute_counterfactual_logprobs(
     model, prompt_ids, counterfactual_prompt_ids, generated_ids
