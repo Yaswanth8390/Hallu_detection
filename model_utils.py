@@ -26,12 +26,13 @@ class GenerationResult:
 def load_model(dtype: torch.dtype = torch.bfloat16, device: str = "cuda", load_in_8bit: bool = True):
     """Load Qwen2.5-7B-Instruct and its tokenizer.
 
-    load_in_8bit=True (default) quantizes weights to ~7-8GB via bitsandbytes --
-    needed on a single 15GB T4, since bf16 weights alone (~14GB) leave almost
-    no headroom for the forward+backward passes the Jacobian/grounding code
-    needs. Set False if you have a bigger GPU (A100/L4/etc.) and want full
-    precision -- Jacobian magnitudes are somewhat sensitive to quantization,
-    so prefer False when you have the VRAM for it.
+    device="auto" with load_in_8bit=False splits full bf16 weights across
+    all visible GPUs via accelerate (e.g. two 15GB T4s = ~30GB pooled) --
+    use this if you have >1 GPU and want full precision without the
+    quantization tradeoff. load_in_8bit=True (default) instead quantizes
+    weights to ~7-8GB via bitsandbytes, for when you only have a single
+    smaller GPU. Don't combine "auto" + 8bit unless you actually need both;
+    8-bit already frees enough memory that one T4 is usually plenty.
     """
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     quant_config = BitsAndBytesConfig(load_in_8bit=True) if load_in_8bit else None
@@ -50,10 +51,31 @@ def load_model(dtype: torch.dtype = torch.bfloat16, device: str = "cuda", load_i
     return model, tokenizer
 
 
+def input_device(model) -> torch.device:
+    """Device holding the input embedding weights -- always the correct place
+    to put input_ids/inputs_embeds, whether the model is on one GPU or split
+    across several via device_map="auto".
+    """
+    return model.get_input_embeddings().weight.device
+
+
+def output_device(model) -> torch.device:
+    """Device holding the lm_head weights -- the correct place to move a
+    hidden-state vector to before manually calling model.lm_head(...), since
+    with a multi-GPU device_map the last transformer layer and lm_head can
+    end up on different devices than the input embeddings.
+    """
+    return model.lm_head.weight.device
+
+
 @torch.no_grad()
 def generate_answer(model, tokenizer, question: str, device: str = "cuda",
                      max_new_tokens: int = 32) -> GenerationResult:
     """Greedy-decode a short answer to `question` using the chat template.
+
+    `device` is accepted for backward compatibility but input_ids are always
+    placed on input_device(model) -- pass device="auto" (matching load_model)
+    and this still does the right thing under a multi-GPU device_map.
 
     Greedy decoding is used deliberately: we want a single, reproducible
     generation path to attribute (sampling would make the Jacobian analysis
@@ -64,7 +86,7 @@ def generate_answer(model, tokenizer, question: str, device: str = "cuda",
         {"role": "user", "content": question},
     ]
     prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    prompt_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
+    prompt_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(input_device(model))
 
     out = model.generate(
         prompt_ids,

@@ -26,6 +26,8 @@ from typing import List, Optional, Tuple
 
 import torch
 
+from model_utils import input_device
+
 
 def find_entity_span(tokenizer, prompt_ids: torch.Tensor, entity: str) -> Optional[Tuple[int, int]]:
     """Find the (start, end) token index range in prompt_ids whose decoded text
@@ -57,8 +59,12 @@ def gradient_grounding_score(model, full_ids: torch.Tensor, position: int,
     the entity span vs. everything else. High fraction => token's logit is
     gradient-sensitive to the entity; low fraction => logit barely depends on
     the entity at all (candidate hallucination signal).
+
+    `device` is accepted for backward compatibility but ignored -- inputs
+    always go on input_device(model), correct whether the model is on one
+    GPU or split across several via device_map="auto".
     """
-    full_ids = full_ids.to(device).unsqueeze(0)
+    full_ids = full_ids.to(input_device(model)).unsqueeze(0)
     model.zero_grad(set_to_none=True)
 
     embed_layer = model.get_input_embeddings()
@@ -98,8 +104,11 @@ def ablation_grounding_score(model, tokenizer, full_ids: torch.Tensor, position:
     relying on that entity (well-grounded). Little to no change => the model
     predicted the token largely independent of the entity being present at
     all, which is the hallucination-flavored failure mode we're hunting for.
+
+    `device` is accepted for backward compatibility but ignored -- inputs
+    always go on input_device(model).
     """
-    full_ids = full_ids.to(device).unsqueeze(0).clone()
+    full_ids = full_ids.to(input_device(model)).unsqueeze(0).clone()
     start, end = entity_span
     target_token_id = full_ids[0, position].item()
 

@@ -37,17 +37,30 @@ input entity, as a candidate interpretable hallucination signal.
 
 ## Setup
 ```
-pip install torch transformers datasets accelerate
+pip install torch transformers datasets accelerate bitsandbytes
 ```
-Needs a GPU (~16-20GB VRAM for bf16 Qwen2.5-7B). For less VRAM, load with
-`load_in_8bit=True` / `load_in_4bit=True` (bitsandbytes) in `model_utils.py`.
+Needs a GPU. Two options, both handled by `run_pipeline.py`'s flags:
+- **Single 15GB GPU (e.g. one T4)**: default. 8-bit quantized weights
+  (~7-8GB), leaves headroom for the forward+backward passes.
+- **Two 15GB GPUs (e.g. Kaggle's dual T4)**: `--device auto --full-precision`.
+  Splits full bf16 weights across both GPUs via accelerate (~14GB pooled
+  across ~30GB), avoiding the 8-bit precision tradeoff. All the manual
+  `model.lm_head(...)` / `model.get_input_embeddings()(...)` calls in
+  `jacobian.py`/`grounding.py` place tensors via `input_device(model)` /
+  `output_device(model)` rather than a hardcoded device string, so this
+  works correctly even when different layers end up on different GPUs.
 
 ## Run
 ```
+# single GPU, 8-bit
 python run_pipeline.py --n 50 --out results.csv --per-token-out results_tokens.csv
+
+# two GPUs, full precision
+python run_pipeline.py --device auto --full-precision --n 50 --out results.csv --per-token-out results_tokens.csv
+
 python evaluate.py --in results.csv
 ```
-Cost scales with answer length now (one forward+backward per generated token
+Cost scales with answer length (one forward+backward per generated token
 per score type) — use `--max-new-tokens` to cap it if answers run long.
 
 ## What I could NOT test here

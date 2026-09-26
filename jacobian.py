@@ -22,6 +22,8 @@ from typing import List
 
 import torch
 
+from model_utils import input_device, output_device
+
 
 @dataclass
 class TokenJacobianTrace:
@@ -38,8 +40,14 @@ def compute_layerwise_jacobian(model, full_ids: torch.Tensor, positions: List[in
 
     `positions` should be the indices of the generated tokens in `full_ids`
     (i.e. prompt_len, prompt_len+1, ...).
+
+    `device` is accepted for backward compatibility but ignored for actual
+    placement -- input_ids go on input_device(model) and the manual lm_head
+    call happens on output_device(model), so this is correct whether the
+    model lives on one GPU or is split across several via device_map="auto".
     """
-    full_ids = full_ids.to(device).unsqueeze(0)  # (1, seq_len)
+    full_ids = full_ids.to(input_device(model)).unsqueeze(0)  # (1, seq_len)
+    lm_head_device = output_device(model)
     traces = []
 
     # One forward+backward per target position. This is O(num_generated_tokens)
@@ -58,7 +66,7 @@ def compute_layerwise_jacobian(model, full_ids: torch.Tensor, positions: List[in
         # in most HF causal LMs the norm is applied inside the model before hidden_states
         # is returned as the last element -- check model.config for exact norm placement
         # if results look off).
-        final_hidden = hidden_states[-1][0, p - 1, :]      # (hidden_dim,)
+        final_hidden = hidden_states[-1][0, p - 1, :].to(lm_head_device)  # (hidden_dim,)
         logits_at_pos = model.lm_head(final_hidden)         # (vocab,)
         target_logit = logits_at_pos[target_token_id]
 

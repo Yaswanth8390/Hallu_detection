@@ -56,10 +56,17 @@ def main():
     parser.add_argument("--max-new-tokens", type=int, default=16,
                          help="cap on generated answer length -- controls cost, since "
                               "every generated token now gets its own Jacobian+grounding pass")
-    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--device", type=str, default="cuda",
+                         help='"cuda" for one GPU, "auto" to split the model across all '
+                              "visible GPUs via accelerate (e.g. two T4s)")
+    parser.add_argument("--load-in-8bit", action="store_true", default=True,
+                         help="quantize weights to ~7-8GB (default; needed for a single 15GB GPU)")
+    parser.add_argument("--full-precision", dest="load_in_8bit", action="store_false",
+                         help="load full bf16 weights instead -- use with --device auto on "
+                              "multiple GPUs, or a single GPU with >20GB VRAM")
     args = parser.parse_args()
 
-    model, tokenizer = load_model(device=args.device)
+    model, tokenizer = load_model(device=args.device, load_in_8bit=args.load_in_8bit)
     examples = load_truthfulqa(limit=args.n)
 
     example_rows = []
