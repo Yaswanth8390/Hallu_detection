@@ -1,50 +1,91 @@
-# Token-Level Counterfactual Input Dependence
+# Token-level semantic evidence and HARP detection
 
-The pipeline measures how much each generated content word depends on the provided user question. It does not determine factual correctness or hallucination.
+This pipeline keeps the existing semantic evidence-span matcher and
+counterfactual `delta_logprob = logP(original) - logP(span-removed)` score,
+then adds token-level HARP features and a supervised Logistic Regression
+classifier. It does not use Jacobian trajectories or a late-layer trajectory
+heuristic.
 
-## Scoring
+## Features and labels
 
-The current TruthfulQA input provides a question, but no supporting passage or evidence-span annotations. For each generated content word, the pipeline obtains final-layer contextual representations for the generated subtokens and candidate contiguous question spans. It mean-pools each word/span representation and selects the span with maximum cosine similarity, searching spans up to five question words. The selected span alone is removed for that word's counterfactual. This can associate a paraphrased cue such as `1984` with a representation for `Orwell`, but similarity is only a span proposal: it does not verify that the question entails or factually supports the generated claim. If no candidate span can be aligned to prompt tokens, the row is retained as `no_matching_evidence_span` without a counterfactual score.
+One CSV row is emitted per generated content word. The dataset includes the
+requested `token`, `evidence_span`, `counterfactual_score`,
+`semantic_similarity`, `HARP_features`, and `label` columns, plus answer,
+token-offset, and label-source metadata.
 
-The exact generated token IDs are held fixed in both conditions. For each subtoken, the model computes its conditional log-probability given the corresponding prompt and the same generated prefix before that subtoken. The original and counterfactual conditional log-probabilities are summed across the subtokens of each content word:
+HARP features follow the paper's reasoning-subspace projection formulation:
+the output/unembedding weight is decomposed through its hidden-dimension Gram
+matrix; the semantic rank is `k = floor(0.95 * hidden_size)`, and the remaining
+lowest-singular-value right-singular vectors form `V_R`. For the causal hidden
+state `h_t` that predicts each generated subtoken, the feature is
+`V_R.T @ h_t`. A content word split into multiple model subtokens receives the
+mean of those per-subtoken projections. The basis is saved to
+`harp_basis.pt` so training and inference use identical coordinates.
 
-```text
-delta_logprob = original_logprob - counterfactual_logprob
-```
+Content words are selected with spaCy's POS and entity tags (open-class
+adjectives, adverbs, nouns, proper nouns, numbers, and verbs, plus named-entity
+tokens), not a manually maintained function-word list. The selected semantic
+span and its similarity are evidence-matching features, not entailment checks.
+Likewise, `counterfactual_score` measures input dependence; neither it nor
+semantic similarity by itself determines whether a token is hallucinated.
+The classifier learns from all of these features together with HARP features.
 
-A positive delta means the matched question span increased support for that word relative to the span-removed prompt. A near-zero delta means weak dependence on that span. A negative delta means the word was more likely without that span. None of these labels establishes correctness, and low dependence on its own does not distinguish two very different situations: the model already knew the fact (parametric knowledge), or the model was confabulating regardless of what was asked.
+TruthfulQA does not supply token-level hallucination annotations. Consequently
+`label` is a weak proxy: the existing answer-level lexical-overlap correctness
+heuristic is copied to every content word in that answer
+(`1 = answer heuristic says incorrect`, `0 = says correct`). This limitation
+is recorded in `label_source`; the detector's output should not be treated as
+token-ground-truth performance until trained/evaluated with genuine token
+annotations.
 
-To separate those, each word also gets an entropy and a top1-vs-top2 log-probability margin (both in nats) from the model's *original*-prompt distribution at that position, from the same forward pass used for `original_logprob`. Low entropy / high margin means the model would likely produce this word regardless of the prompt. This is layered on top of the dependence label, not used alone: words already showing `strong_input_dependence` are left as-is (`combined_classification=input_dependent`), since the dependence signal already explains the question's role there. For the remaining words, low original-prompt entropy against `--entropy-threshold` yields `parametric_knowledge`; high entropy yields `possible_hallucination`. This still is not a correctness label — it only distinguishes "confident regardless of prompt" from "not confident and not prompt-dependent either," and the entropy threshold needs the same experimental calibration as `--dependence-threshold`.
+## Setup and dataset generation
 
-Words are grouped from tokenizer offsets so multi-subtoken words receive one row. Punctuation and a conservative list of grammatical/function words are skipped. Each row retains `generated_text` so the original generated response can be reconstructed, and includes the token, selected evidence span and its similarity, both log-probabilities, delta, dependence classification and threshold, word entropy and margin, entropy threshold, confidence classification, the combined classification, and a final binary `hallucination_label` (`hallucination` iff `combined_classification` is `possible_hallucination`, otherwise `not_hallucination`).
-
-`hallucination_label` inherits every limitation above: a word the model states confidently and consistently but which is still wrong -- a contested or fabricated fact given with low entropy -- reads as `not_hallucination` here, because low entropy is read as parametric knowledge regardless of whether that knowledge is correct. Telling those apart would need something like resampling the same question and checking whether the word is stable across samples, which this label does not do.
-
-## Run
-
-Install the packages in `requirements.txt`, then run on a GPU:
+Install `requirements.txt` and the spaCy English tagger:
 
 ```sh
-python run_pipeline.py --n 10 --max-new-tokens 32 --dependence-threshold 0.1 --entropy-threshold 1.0 --out results_tokens.csv --per-token-out results_tokens.csv
+python -m spacy download en_core_web_sm
 ```
 
-`--grounding-threshold` remains as a compatibility alias for `--dependence-threshold`. The default dependence threshold is `0.1` log-probability units and should be calibrated experimentally; low dependence is reported as `weak_input_dependence`, never as hallucination. `--entropy-threshold` (default `1.0` nats) similarly needs calibration per model/vocabulary before its `parametric_knowledge` / `possible_hallucination` split should be trusted.
+Generate features with the configured Qwen model on a GPU:
 
-The smoke tests use tiny random-initialized Qwen models and an offset-tokenizer fixture, so they validate log-probability extraction, subword aggregation, labels, and CSV formatting without downloading model weights or TruthfulQA:
+```sh
+python run_pipeline.py --n 50 --max-new-tokens 32 \
+  --out results_tokens.csv --harp-basis-out harp_basis.pt
+```
+
+By default, model weights are loaded in 8-bit mode. Use `--full-precision` to
+disable it. Use `--content-tagger` to select a different installed spaCy model.
+
+## Train and infer
+
+Train Logistic Regression from the generated rows. Validation splits are
+grouped by answer/example to prevent token rows from the same answer leaking
+across the held-out split; the final saved estimator is then fit on all rows.
+
+```sh
+python train_detector.py --data results_tokens.csv \
+  --harp-basis harp_basis.pt --out token_detector.joblib
+```
+
+Generate a full sentence and receive per-content-token hallucination
+probabilities. The response text remains intact; only its individual content
+tokens receive flags.
+
+```sh
+python infer.py --question "Who wrote 1984?" \
+  --detector token_detector.joblib --threshold 0.5
+```
+
+The detector threshold defaults to `0.5`, matching the paper's binary
+threshold convention. It can be changed with `--threshold`.
+
+## Smoke tests
+
+The tests use small randomly initialized models and test token alignment,
+semantic matching, and counterfactual log-probabilities without downloading
+the target model:
 
 ```sh
 python tests/smoke_test.py
 python tests/smoke_test_multitoken.py
 ```
-
-## Benchmark
-
-Every row also carries `example_index` and a ground-truth `is_correct_heuristic` from TruthfulQA's own lexical-overlap heuristic (`dataset.label_correctness`, `--overlap-threshold`, default `0.3`) -- this is a rough heuristic, not human judgment, see that function's docstring.
-
-`evaluate.py` rolls the per-word `hallucination_label`s up to one prediction per TruthfulQA question (the fraction of that answer's words flagged `hallucination`, thresholded by `--flag-fraction-threshold`, default `0.0` = "any flagged word counts") and reports accuracy/precision/recall/F1/ROC-AUC/confusion-matrix against that ground truth, plus a handful of concrete disagreements to read by hand:
-
-```sh
-python evaluate.py --in results_tokens.csv
-```
-
-This needs a CSV from the current `run_pipeline.py` -- it refuses an older results CSV missing `example_index` / `hallucination_label` / `is_correct_heuristic` rather than silently computing nonsense. Treat any single number here as provisional: it is downstream of four independently-uncalibrated thresholds (`--dependence-threshold`, `--entropy-threshold`, `--overlap-threshold`, `--flag-fraction-threshold`).

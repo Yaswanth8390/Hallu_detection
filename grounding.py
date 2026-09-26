@@ -8,31 +8,26 @@ import torch.nn.functional as F
 from model_utils import input_device
 
 
-_FUNCTION_WORDS = {
-    "a", "an", "the", "and", "or", "but", "if", "then", "than", "as",
-    "at", "by", "for", "from", "in", "into", "of", "on", "onto", "per",
-    "to", "upon", "via", "with", "about", "above", "after", "against",
-    "along", "among", "around", "before", "behind", "below", "beneath",
-    "beside", "between", "beyond", "during", "inside", "near", "off", "out",
-    "over", "through", "under", "until", "up", "without", "i", "me", "my",
-    "mine", "we", "us", "our", "ours", "you", "your", "yours", "he", "him",
-    "his", "she", "her", "hers", "it", "its", "they", "them", "their",
-    "theirs", "this", "that", "these", "those", "who", "whom", "whose",
-    "which", "what", "where", "when", "why", "how", "am", "is", "are", "was",
-    "were", "be", "been", "being", "do", "does", "did", "doing", "have",
-    "has", "had", "having", "can", "could", "may", "might", "must", "shall",
-    "should", "will", "would", "also", "very", "just", "some", "any", "each",
-    "every", "both", "either", "neither", "such", "own", "same", "more", "most",
-    "other", "another", "few", "many", "much", "less", "least", "because",
-    "although", "though", "while", "since", "unless", "nor", "yet", "there",
-}
-
+_CONTENT_POS_TAGS = {"ADJ", "ADV", "NOUN", "NUM", "PROPN", "VERB"}
 _WORD_PATTERN = re.compile(r"[^\W_]+(?:['’][^\W_]+)*", re.UNICODE)
 
 
+def load_content_tagger(model_name: str = "en_core_web_sm"):
+    """Load a POS/NER tagger so content words are selected linguistically."""
+    import spacy
+
+    try:
+        return spacy.load(model_name)
+    except OSError as error:
+        raise RuntimeError(
+            f"Could not load spaCy model {model_name!r}. Install it with "
+            f"`python -m spacy download {model_name}`."
+        ) from error
+
+
 def content_word_groups(tokenizer, generated_ids, generated_text: str,
-                        prompt_len: int) -> list[dict]:
-    """Return content words and their generated positions, grouped by offsets.
+                        prompt_len: int, pos_tagger) -> list[dict]:
+    """Return POS/NER-selected content words with their generated positions.
 
     Subword pieces overlapping the same complete lexical word are kept in one
     group. A clear error is raised if decoded text cannot be aligned back to
@@ -59,16 +54,21 @@ def content_word_groups(tokenizer, generated_ids, generated_text: str,
         )
 
     groups = []
-    for match in _WORD_PATTERN.finditer(generated_text):
-        word = match.group()
-        if word.casefold() in _FUNCTION_WORDS:
+    for word in pos_tagger(generated_text):
+        if word.is_space or word.is_punct:
             continue
+        if word.pos_ not in _CONTENT_POS_TAGS and not word.ent_type_:
+            continue
+        start = word.idx
+        end = start + len(word.text)
         piece_indices = [index for index, (start, end) in enumerate(offsets)
-                         if end > match.start() and start < match.end()]
+                         if end > word.idx and start < word.idx + len(word.text)]
         if not piece_indices:
             continue
         groups.append({
-            "token": word,
+            "token": word.text,
+            "char_start": start,
+            "char_end": end,
             "token_indices": [ordinary[index][0] for index in piece_indices],
             "subtoken_count": len(piece_indices),
         })
@@ -173,55 +173,3 @@ def classify_input_dependence(delta_logprob: float, threshold: float) -> str:
     if delta_logprob <= -threshold:
         return "negative_input_dependence"
     return "weak_input_dependence"
-
-
-def classify_confidence(entropy: float, entropy_threshold: float) -> str:
-    """Classify a word's original-prompt confidence, independent of the
-    question. This says nothing about correctness by itself -- it only says
-    whether the model would likely produce this word regardless of prompt.
-    Needs experimental calibration per model/vocab, same as
-    classify_input_dependence's threshold.
-    """
-    return "confident" if entropy <= entropy_threshold else "uncertain"
-
-
-def combine_input_dependence_and_confidence(dependence_classification: str,
-                                            confidence_classification: str) -> str:
-    """Layer per-word confidence on top of input-dependence.
-
-    Input-dependence alone cannot separate two very different situations
-    that both show up as "the question didn't matter for this word":
-    the model already knew the fact (parametric knowledge), or the model
-    was confabulating regardless of what was asked. Confidence from the
-    original, unmodified prompt distinguishes these. A word that already
-    showed strong dependence on the question is left alone -- the
-    dependence signal is doing the explaining there, and splitting it
-    further by confidence would not add information about the question's
-    role.
-    """
-    if dependence_classification == "strong_input_dependence":
-        return "input_dependent"
-    if confidence_classification == "confident":
-        return "parametric_knowledge"
-    return "possible_hallucination"
-
-
-def final_hallucination_label(combined_classification: str) -> str:
-    """Collapse the three-way combined label into the binary call the task
-    actually asks for. Everything that isn't flagged as a possible
-    hallucination -- input-dependent words and words read as confident,
-    prompt-independent parametric knowledge -- is reported as not a
-    hallucination.
-
-    This inherits every limitation of `combined_classification` verbatim:
-    a word the model states confidently and consistently, but which is
-    still wrong (a contested or fabricated fact stated with low entropy),
-    will be labeled `not_hallucination` here. Confidence regardless of the
-    prompt is evidence of parametric knowledge, not proof it's correct --
-    telling those apart would need something like resampling the same
-    question and checking whether the word is stable, which this label
-    does not do.
-    """
-    if combined_classification == "possible_hallucination":
-        return "hallucination"
-    return "not_hallucination"

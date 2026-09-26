@@ -8,14 +8,34 @@ import torch
 from transformers import AutoModelForCausalLM, Qwen2Config
 
 from grounding import (
-    classify_confidence,
     classify_input_dependence,
-    combine_input_dependence_and_confidence,
     content_word_groups,
-    final_hallucination_label,
     select_semantic_evidence_spans,
 )
+from harp import build_reasoning_basis, project_content_tokens
 from jacobian import compute_counterfactual_logprobs, compute_token_confidence
+
+
+class TaggedWord:
+    def __init__(self, text, idx, pos, is_punct=False):
+        self.text = text
+        self.idx = idx
+        self.pos_ = pos
+        self.ent_type_ = ""
+        self.is_space = False
+        self.is_punct = is_punct
+
+
+class FixtureTagger:
+    def __call__(self, text):
+        words = [
+            ("The", 0, "DET", False),
+            ("Internationalization", 4, "NOUN", False),
+            ("42", 25, "NUM", False),
+            (".", 27, "PUNCT", True),
+        ]
+        assert text == "The Internationalization 42."
+        return [TaggedWord(*word) for word in words]
 
 
 class OffsetTokenizer:
@@ -78,7 +98,7 @@ counterfactual_prompt_ids = torch.tensor([10, 13])
 generated_ids = torch.tensor([11, 21, 22, 23, 24])
 sentence = "The Internationalization 42."
 groups = content_word_groups(
-    OffsetTokenizer(), generated_ids, sentence, len(prompt_ids)
+    OffsetTokenizer(), generated_ids, sentence, len(prompt_ids), FixtureTagger()
 )
 assert [group["token"] for group in groups] == ["Internationalization", "42"]
 assert groups[0]["token_indices"] == [1, 2]
@@ -153,37 +173,24 @@ assert classify_input_dependence(-0.5, 0.1) == "negative_input_dependence"
 assert classify_input_dependence(0.05, 0.1) == "weak_input_dependence"
 assert all(row["generated_text"] == sentence for row in rows)
 
-assert classify_confidence(0.5, 1.0) == "confident"
-assert classify_confidence(1.5, 1.0) == "uncertain"
-
-# strong dependence is left alone regardless of confidence
-assert combine_input_dependence_and_confidence(
-    "strong_input_dependence", "confident"
-) == "input_dependent"
-assert combine_input_dependence_and_confidence(
-    "strong_input_dependence", "uncertain"
-) == "input_dependent"
-# low/no dependence is where confidence does the separating
-assert combine_input_dependence_and_confidence(
-    "weak_input_dependence", "confident"
-) == "parametric_knowledge"
-assert combine_input_dependence_and_confidence(
-    "weak_input_dependence", "uncertain"
-) == "possible_hallucination"
-assert combine_input_dependence_and_confidence(
-    "no_matching_evidence_span", "confident"
-) == "parametric_knowledge"
-
-assert final_hallucination_label("possible_hallucination") == "hallucination"
-assert final_hallucination_label("parametric_knowledge") == "not_hallucination"
-assert final_hallucination_label("input_dependent") == "not_hallucination"
-
 confidence = compute_token_confidence(model, prompt_ids, generated_ids)
 assert confidence["logprob"].shape == generated_ids.shape
 assert confidence["entropy"].shape == generated_ids.shape
 assert confidence["margin"].shape == generated_ids.shape
 assert torch.all(confidence["entropy"] >= 0)
 assert torch.all(confidence["margin"] >= 0)
+
+reasoning_basis = build_reasoning_basis(model, semantic_fraction=0.75)
+assert reasoning_basis.shape == (64, 16)
+assert torch.allclose(
+    reasoning_basis.T @ reasoning_basis, torch.eye(16), atol=1e-5
+)
+harp_vectors = project_content_tokens(
+    model, prompt_ids, generated_ids, groups, reasoning_basis
+)
+assert len(harp_vectors) == len(groups)
+assert all(len(vector) == 16 for vector in harp_vectors)
+assert all(torch.isfinite(torch.tensor(vector)).all() for vector in harp_vectors)
 
 buffer = io.StringIO()
 writer = csv.DictWriter(buffer, fieldnames=list(rows[0]))
@@ -197,3 +204,4 @@ assert {"evidence_span", "original_logprob", "counterfactual_logprob",
         "delta_logprob", "classification"}.issubset(read_back[0])
 
 print("Grouped counterfactual score smoke test passed:", rows)
+print("HARP reasoning-subspace projection smoke test passed.")

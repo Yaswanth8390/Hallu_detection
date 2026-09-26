@@ -1,5 +1,5 @@
 """
-Model loading + generation utilities for the Jacobian hallucination-detection pipeline.
+Model loading + generation utilities for token-level hallucination analysis.
 
 Target model: Qwen/Qwen2.5-7B-Instruct
 Uses FP16 by default, which is supported by T4 GPUs; load in 8-bit on smaller GPUs.
@@ -49,12 +49,8 @@ def load_model(dtype: torch.dtype = torch.float16, device: str = "cuda", load_in
         model.to(device)
     model.eval()
 
-    # We only ever need gradients w.r.t. hidden states (via retain_grad in
-    # jacobian.py), never w.r.t. the model's own weights. Without
-    # this, every backward() call also allocates and stores a full gradient
-    # buffer for all 7B parameters (~same size as the weights themselves),
-    # which is very likely what's causing backward-pass OOMs even after
-    # splitting weights across GPUs -- freezing removes that waste entirely.
+    # The scoring pipeline uses inference-only forward passes; model weights
+    # never need gradients.
     for p in model.parameters():
         p.requires_grad_(False)
 
@@ -88,7 +84,7 @@ def generate_answer(model, tokenizer, question: str, device: str = "cuda",
     and this still does the right thing under a multi-GPU device_map.
 
     Greedy decoding is used deliberately: we want a single, reproducible
-    generation path to attribute (sampling would make the Jacobian analysis
+    generation path to attribute (sampling would make the feature extraction
     non-deterministic across runs).
     """
     messages = [
