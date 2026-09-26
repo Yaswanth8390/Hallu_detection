@@ -135,14 +135,14 @@ def compute_layerwise_jacobian(model, full_ids: torch.Tensor, positions: List[in
 
         target_logit.backward()
 
-        for i, hs in enumerate(all_hidden):
-            print(
-                f"layer {i}: "
-                f"requires_grad={hs.requires_grad}, "
-                f"is_leaf={hs.is_leaf}, "
-                f"grad_fn={type(hs.grad_fn).__name__ if hs.grad_fn else None}, "
-                f"grad_none={hs.grad is None}"
-            )
+#        for i, hs in enumerate(all_hidden):
+#            print(
+#                f"layer {i}: "
+#                f"requires_grad={hs.requires_grad}, "
+#                f"is_leaf={hs.is_leaf}, "
+#                f"grad_fn={type(hs.grad_fn).__name__ if hs.grad_fn else None}, "
+#                f"grad_none={hs.grad is None}"
+#            )
 
         layer_grad_norms = []
         layer_grads = []
