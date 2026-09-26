@@ -173,3 +173,34 @@ def classify_input_dependence(delta_logprob: float, threshold: float) -> str:
     if delta_logprob <= -threshold:
         return "negative_input_dependence"
     return "weak_input_dependence"
+
+
+def classify_confidence(entropy: float, entropy_threshold: float) -> str:
+    """Classify a word's original-prompt confidence, independent of the
+    question. This says nothing about correctness by itself -- it only says
+    whether the model would likely produce this word regardless of prompt.
+    Needs experimental calibration per model/vocab, same as
+    classify_input_dependence's threshold.
+    """
+    return "confident" if entropy <= entropy_threshold else "uncertain"
+
+
+def combine_input_dependence_and_confidence(dependence_classification: str,
+                                            confidence_classification: str) -> str:
+    """Layer per-word confidence on top of input-dependence.
+
+    Input-dependence alone cannot separate two very different situations
+    that both show up as "the question didn't matter for this word":
+    the model already knew the fact (parametric knowledge), or the model
+    was confabulating regardless of what was asked. Confidence from the
+    original, unmodified prompt distinguishes these. A word that already
+    showed strong dependence on the question is left alone -- the
+    dependence signal is doing the explaining there, and splitting it
+    further by confidence would not add information about the question's
+    role.
+    """
+    if dependence_classification == "strong_input_dependence":
+        return "input_dependent"
+    if confidence_classification == "confident":
+        return "parametric_knowledge"
+    return "possible_hallucination"

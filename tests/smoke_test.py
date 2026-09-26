@@ -3,7 +3,7 @@
 import torch
 from transformers import AutoModelForCausalLM, Qwen2Config
 
-from jacobian import compute_counterfactual_logprobs
+from jacobian import compute_counterfactual_logprobs, compute_token_confidence
 
 torch.manual_seed(0)
 
@@ -34,3 +34,15 @@ assert torch.all(scores["original_token_logprobs"] <= 0)
 assert torch.all(scores["counterfactual_token_logprobs"] <= 0)
 
 print("Counterfactual conditional-logprob smoke test passed:", scores)
+
+confidence = compute_token_confidence(model, original_prompt_ids, generated_ids)
+assert confidence["logprob"].shape == generated_ids.shape
+assert confidence["entropy"].shape == generated_ids.shape
+assert confidence["margin"].shape == generated_ids.shape
+assert torch.equal(confidence["logprob"], scores["original_token_logprobs"])
+assert torch.all(confidence["entropy"] >= 0)
+assert torch.all(confidence["margin"] >= 0)
+assert torch.isfinite(confidence["entropy"]).all()
+assert torch.isfinite(confidence["margin"]).all()
+
+print("Token confidence (entropy/margin) smoke test passed:", confidence)

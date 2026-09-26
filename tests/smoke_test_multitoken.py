@@ -8,11 +8,13 @@ import torch
 from transformers import AutoModelForCausalLM, Qwen2Config
 
 from grounding import (
+    classify_confidence,
     classify_input_dependence,
+    combine_input_dependence_and_confidence,
     content_word_groups,
     select_semantic_evidence_spans,
 )
-from jacobian import compute_counterfactual_logprobs
+from jacobian import compute_counterfactual_logprobs, compute_token_confidence
 
 
 class OffsetTokenizer:
@@ -149,6 +151,34 @@ assert classify_input_dependence(0.5, 0.1) == "strong_input_dependence"
 assert classify_input_dependence(-0.5, 0.1) == "negative_input_dependence"
 assert classify_input_dependence(0.05, 0.1) == "weak_input_dependence"
 assert all(row["generated_text"] == sentence for row in rows)
+
+assert classify_confidence(0.5, 1.0) == "confident"
+assert classify_confidence(1.5, 1.0) == "uncertain"
+
+# strong dependence is left alone regardless of confidence
+assert combine_input_dependence_and_confidence(
+    "strong_input_dependence", "confident"
+) == "input_dependent"
+assert combine_input_dependence_and_confidence(
+    "strong_input_dependence", "uncertain"
+) == "input_dependent"
+# low/no dependence is where confidence does the separating
+assert combine_input_dependence_and_confidence(
+    "weak_input_dependence", "confident"
+) == "parametric_knowledge"
+assert combine_input_dependence_and_confidence(
+    "weak_input_dependence", "uncertain"
+) == "possible_hallucination"
+assert combine_input_dependence_and_confidence(
+    "no_matching_evidence_span", "confident"
+) == "parametric_knowledge"
+
+confidence = compute_token_confidence(model, prompt_ids, generated_ids)
+assert confidence["logprob"].shape == generated_ids.shape
+assert confidence["entropy"].shape == generated_ids.shape
+assert confidence["margin"].shape == generated_ids.shape
+assert torch.all(confidence["entropy"] >= 0)
+assert torch.all(confidence["margin"] >= 0)
 
 buffer = io.StringIO()
 writer = csv.DictWriter(buffer, fieldnames=list(rows[0]))

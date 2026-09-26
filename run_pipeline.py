@@ -4,8 +4,14 @@ import argparse
 import csv
 
 from dataset import load_truthfulqa
-from grounding import classify_input_dependence, content_word_groups, select_semantic_evidence_spans
-from jacobian import compute_counterfactual_logprobs, compute_token_logprobs
+from grounding import (
+    classify_confidence,
+    classify_input_dependence,
+    combine_input_dependence_and_confidence,
+    content_word_groups,
+    select_semantic_evidence_spans,
+)
+from jacobian import compute_counterfactual_logprobs, compute_token_confidence
 from model_utils import generate_answer, load_model
 
 
@@ -21,6 +27,11 @@ def main():
     parser.add_argument("--dependence-threshold", "--grounding-threshold",
                         dest="dependence_threshold", type=float, default=0.1,
                         help="log-probability-delta threshold for input-dependence labels")
+    parser.add_argument("--entropy-threshold", type=float, default=1.0,
+                        help="nats; original-prompt entropy at/below this counts as "
+                             "'confident' when separating parametric knowledge from "
+                             "possible hallucination for low-dependence words. Should "
+                             "be calibrated experimentally, same as --dependence-threshold.")
     parser.add_argument("--device", type=str, default="cuda",
                         help='"cuda" for one GPU, "auto" to split across visible GPUs')
     parser.add_argument("--load-in-8bit", action="store_true", default=True,
@@ -30,6 +41,8 @@ def main():
     args = parser.parse_args()
     if args.dependence_threshold < 0.0:
         parser.error("--dependence-threshold must be nonnegative")
+    if args.entropy_threshold < 0.0:
+        parser.error("--entropy-threshold must be nonnegative")
 
     model, tokenizer = load_model(device=args.device, load_in_8bit=args.load_in_8bit)
     examples = load_truthfulqa(limit=args.n)
@@ -50,9 +63,12 @@ def main():
             model, tokenizer, generation.prompt, generation.prompt_ids,
             generation.generated_ids, example.question, word_groups,
         )
-        original_scores = compute_token_logprobs(
+        original_stats = compute_token_confidence(
             model, generation.prompt_ids, generation.generated_ids
         )
+        original_scores = original_stats["logprob"]
+        original_entropy = original_stats["entropy"]
+        original_margin = original_stats["margin"]
         counterfactual_cache = {}
 
         for token_index, group in enumerate(word_groups):
@@ -99,6 +115,19 @@ def main():
                 evidence_text = ""
                 counterfactual_change = "not_scored_no_span"
 
+            word_entropy = sum(
+                original_entropy[index].item() for index in token_indices
+            ) / len(token_indices)
+            word_margin = sum(
+                original_margin[index].item() for index in token_indices
+            ) / len(token_indices)
+            confidence_classification = classify_confidence(
+                word_entropy, args.entropy_threshold
+            )
+            combined_classification = combine_input_dependence_and_confidence(
+                classification, confidence_classification
+            )
+
             token_rows.append({
                 "question": example.question,
                 "generated_text": generation.generated_text,
@@ -113,11 +142,18 @@ def main():
                 "delta_logprob": delta_logprob,
                 "classification": classification,
                 "dependence_threshold": args.dependence_threshold,
+                "word_entropy": word_entropy,
+                "word_margin": word_margin,
+                "entropy_threshold": args.entropy_threshold,
+                "confidence_classification": confidence_classification,
+                "combined_classification": combined_classification,
             })
 
             print(f"[{example_index}/{len(examples)}] {group['token']!r}: "
                   f"evidence={evidence_text!r} delta_logprob={delta_logprob} "
-                  f"classification={classification}", flush=True)
+                  f"classification={classification} "
+                  f"confidence={confidence_classification} (entropy={word_entropy:.3f}) "
+                  f"combined={combined_classification}", flush=True)
 
     def write_csv(path):
         if not token_rows:
