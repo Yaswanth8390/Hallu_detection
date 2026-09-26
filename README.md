@@ -1,30 +1,34 @@
-# Token-Level Input-Direction Grounding
+# Token-Level Counterfactual Input Dependence
 
-This pipeline measures how directionally sensitive each generated content word is to the prompt representation. It does not classify answers as correct or hallucinated.
+The pipeline measures how much each generated content word depends on the provided user question. It does not determine factual correctness or hallucination.
 
 ## Scoring
 
-For each generated semantic word, the model's target logits for its subword pieces are summed, and the gradient of that scalar is computed with respect to the prompt input embeddings. The reported `alignment_score` is the cosine similarity between that gradient and the concatenated prompt-embedding direction. The score is signed and remains the primary output; a negative score is not treated as hallucination.
+The current TruthfulQA input provides a question, but no supporting passage or evidence-span annotations. Therefore the declared `evidence_span` is the full question text. The counterfactual removes only that question text from the chat prompt; the system instruction and chat-template structure remain unchanged. This is a query-dependence experiment, not a claim that the question itself contains verified evidence for the answer.
 
-Words are reconstructed from tokenizer offsets so a multi-subword word is scored as one unit. Punctuation and a conservative set of grammatical/function words are skipped. Multiword entities are emitted as their component content words, while subword fragments within each word are grouped together.
+The exact generated token IDs are held fixed in both conditions. For each subtoken, the model computes its conditional log-probability given the corresponding prompt and the same generated prefix before that subtoken. The original and counterfactual conditional log-probabilities are summed across the subtokens of each content word:
 
-`grounding_strength` is `strong` when the absolute cosine reaches `--grounding-threshold`, otherwise `weak`. This is only a directional-strength description, not a correctness or hallucination label. The threshold defaults to `0.1` and can be calibrated experimentally.
+```text
+delta_logprob = original_logprob - counterfactual_logprob
+```
+
+A positive delta means the original question increased support for that word relative to the question-removed prompt. A near-zero delta means weak dependence on the question. A negative delta means the word was more likely without the question. None of these labels establishes correctness or distinguishes question information from parametric model knowledge.
+
+Words are grouped from tokenizer offsets so multi-subtoken words receive one row. Punctuation and a conservative list of grammatical/function words are skipped. Each row retains `generated_text` so the original generated response can be reconstructed, and includes the token, evidence span, both log-probabilities, delta, classification, and threshold.
 
 ## Run
 
 Install the packages in `requirements.txt`, then run on a GPU:
 
 ```sh
-python run_pipeline.py --n 50 --out results.csv --grounding-threshold 0.1
+python run_pipeline.py --n 10 --max-new-tokens 32 --dependence-threshold 0.1 --out results_tokens.csv --per-token-out results_tokens.csv
 ```
 
-Each CSV row represents one evaluated content word and includes its text, alignment score, weak/strong grounding status, threshold, grouped target logit, and subword count. `--per-token-out` remains available for compatibility and writes the same token-level rows as `--out`; neither output is sentence-aggregated.
+`--grounding-threshold` remains as a compatibility alias for `--dependence-threshold`. The default threshold is `0.1` log-probability units and should be calibrated experimentally; low dependence is reported as `weak_input_dependence`, never as hallucination.
 
-The smoke tests use tiny random-initialized Qwen models and a fixed offset-tokenizer fixture, so they validate gradient mechanics and grouping without downloading model weights or TruthfulQA:
+The smoke tests use tiny random-initialized Qwen models and an offset-tokenizer fixture, so they validate log-probability extraction, subword aggregation, labels, and CSV formatting without downloading model weights or TruthfulQA:
 
 ```sh
 python tests/smoke_test.py
 python tests/smoke_test_multitoken.py
 ```
-
-`evaluate.py` and the dataset's lexical answer-label helper are legacy utilities from the previous answer-level experiment; they are not used by this token-level pipeline.

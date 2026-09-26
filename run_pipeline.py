@@ -4,8 +4,8 @@ import argparse
 import csv
 
 from dataset import load_truthfulqa
-from grounding import content_word_groups, grounding_strength
-from jacobian import compute_directional_sensitivity
+from grounding import classify_input_dependence, content_word_groups
+from jacobian import compute_counterfactual_logprobs
 from model_utils import generate_answer, load_model
 
 
@@ -18,8 +18,9 @@ def main():
                         help="compatibility output path; contains the same token-level rows")
     parser.add_argument("--max-new-tokens", type=int, default=16,
                         help="maximum generated subword-token count")
-    parser.add_argument("--grounding-threshold", type=float, default=0.1,
-                        help="absolute cosine threshold for weak/strong grounding status")
+    parser.add_argument("--dependence-threshold", "--grounding-threshold",
+                        dest="dependence_threshold", type=float, default=0.1,
+                        help="log-probability-delta threshold for input-dependence labels")
     parser.add_argument("--device", type=str, default="cuda",
                         help='"cuda" for one GPU, "auto" to split across visible GPUs')
     parser.add_argument("--load-in-8bit", action="store_true", default=True,
@@ -27,8 +28,8 @@ def main():
     parser.add_argument("--full-precision", dest="load_in_8bit", action="store_false",
                         help="load unquantized FP16 weights")
     args = parser.parse_args()
-    if not 0.0 <= args.grounding_threshold <= 1.0:
-        parser.error("--grounding-threshold must be between 0 and 1")
+    if args.dependence_threshold < 0.0:
+        parser.error("--dependence-threshold must be nonnegative")
 
     model, tokenizer = load_model(device=args.device, load_in_8bit=args.load_in_8bit)
     examples = load_truthfulqa(limit=args.n)
@@ -43,28 +44,48 @@ def main():
         word_groups = content_word_groups(
             tokenizer, generation.generated_ids, generation.generated_text, prompt_len
         )
+        if generation.prompt.count(example.question) != 1:
+            raise ValueError("Expected the question exactly once in the generation prompt")
+        counterfactual_prompt = generation.prompt.replace(example.question, "", 1)
+        counterfactual_prompt_ids = tokenizer(
+            counterfactual_prompt, return_tensors="pt"
+        ).input_ids[0]
+        token_logprobs = compute_counterfactual_logprobs(
+            model, generation.prompt_ids, counterfactual_prompt_ids,
+            generation.generated_ids,
+        )
 
         for token_index, group in enumerate(word_groups):
-            score = compute_directional_sensitivity(
-                model, generation.full_ids, prompt_len, group["positions"]
+            token_indices = group["token_indices"]
+            original_logprob = sum(
+                token_logprobs["original_token_logprobs"][index].item()
+                for index in token_indices
             )
-            alignment = score["alignment_score"]
+            counterfactual_logprob = sum(
+                token_logprobs["counterfactual_token_logprobs"][index].item()
+                for index in token_indices
+            )
+            delta_logprob = original_logprob - counterfactual_logprob
             token_rows.append({
                 "question": example.question,
                 "generated_text": generation.generated_text,
                 "token_index_in_answer": token_index,
                 "token": group["token"],
                 "subtoken_count": group["subtoken_count"],
-                "alignment_score": alignment,
-                "grounding_strength": grounding_strength(
-                    alignment, args.grounding_threshold
+                "evidence_span": example.question,
+                "counterfactual_change": "question_text_removed",
+                "original_logprob": original_logprob,
+                "counterfactual_logprob": counterfactual_logprob,
+                "delta_logprob": delta_logprob,
+                "classification": classify_input_dependence(
+                    delta_logprob, args.dependence_threshold
                 ),
-                "grounding_threshold": args.grounding_threshold,
-                "grouped_target_logit": score["target_logit"],
+                "dependence_threshold": args.dependence_threshold,
             })
 
-            print(f"[{example_index}/{len(examples)}] {example.question!r} -> "
-                f"{generation.generated_text!r} ({len(word_groups)} content words scored)")
+            print(f"[{example_index}/{len(examples)}] {group['token']!r}: "
+                  f"delta_logprob={delta_logprob:+.4f} "
+                  f"({token_index + 1}/{len(word_groups)})", flush=True)
 
     def write_csv(path):
         if not token_rows:

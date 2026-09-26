@@ -18,7 +18,8 @@ _FUNCTION_WORDS = {
     "has", "had", "having", "can", "could", "may", "might", "must", "shall",
     "should", "will", "would", "also", "very", "just", "some", "any", "each",
     "every", "both", "either", "neither", "such", "own", "same", "more", "most",
-    "other", "another", "few", "many", "much", "less", "least",
+    "other", "another", "few", "many", "much", "less", "least", "because",
+    "although", "though", "while", "since", "unless", "nor", "yet", "there",
 }
 
 _WORD_PATTERN = re.compile(r"[^\W_]+(?:['’][^\W_]+)*", re.UNICODE)
@@ -63,12 +64,16 @@ def content_word_groups(tokenizer, generated_ids, generated_text: str,
             continue
         groups.append({
             "token": word,
-            "positions": [prompt_len + ordinary[index][0] for index in piece_indices],
+            "token_indices": [ordinary[index][0] for index in piece_indices],
             "subtoken_count": len(piece_indices),
         })
     return groups
 
 
-def grounding_strength(alignment_score: float, threshold: float) -> str:
-    """Describe directional grounding strength without assigning correctness."""
-    return "strong" if abs(alignment_score) >= threshold else "weak"
+def classify_input_dependence(delta_logprob: float, threshold: float) -> str:
+    """Classify prompt dependence without making a correctness judgment."""
+    if delta_logprob >= threshold:
+        return "strong_input_dependence"
+    if delta_logprob <= -threshold:
+        return "negative_input_dependence"
+    return "weak_input_dependence"

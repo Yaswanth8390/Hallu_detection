@@ -1,14 +1,13 @@
-"""Check content-word grouping and grouped-subword scoring on a tiny model."""
+"""Check grouped-word counterfactual scores and token-level CSV output."""
 
 import csv
 import io
-import math
 
 import torch
 from transformers import AutoModelForCausalLM, Qwen2Config
 
-from grounding import content_word_groups, grounding_strength
-from jacobian import compute_directional_sensitivity
+from grounding import classify_input_dependence, content_word_groups
+from jacobian import compute_counterfactual_logprobs
 
 
 class OffsetTokenizer:
@@ -16,11 +15,10 @@ class OffsetTokenizer:
 
     def __call__(self, text, add_special_tokens=False, return_offsets_mapping=False):
         assert text == "The Internationalization 42."
-        result = {
+        return {
             "input_ids": [11, 21, 22, 23, 24],
             "offset_mapping": [(0, 3), (4, 12), (12, 24), (25, 27), (27, 28)],
         }
-        return result
 
 
 torch.manual_seed(0)
@@ -35,44 +33,55 @@ config = Qwen2Config(
 )
 model = AutoModelForCausalLM.from_config(config)
 model.eval()
-for parameter in model.parameters():
-    parameter.requires_grad_(False)
 
 prompt_ids = torch.tensor([10, 12, 13])
+counterfactual_prompt_ids = torch.tensor([10, 13])
 generated_ids = torch.tensor([11, 21, 22, 23, 24])
-full_ids = torch.cat([prompt_ids, generated_ids])
+sentence = "The Internationalization 42."
 groups = content_word_groups(
-    OffsetTokenizer(), generated_ids, "The Internationalization 42.", len(prompt_ids)
+    OffsetTokenizer(), generated_ids, sentence, len(prompt_ids)
 )
 assert [group["token"] for group in groups] == ["Internationalization", "42"]
-assert groups[0]["positions"] == [len(prompt_ids) + 1, len(prompt_ids) + 2]
+assert groups[0]["token_indices"] == [1, 2]
 assert groups[0]["subtoken_count"] == 2
-assert groups[1]["positions"] == [len(prompt_ids) + 3]
+assert groups[1]["token_indices"] == [3]
 
+logprobs = compute_counterfactual_logprobs(
+    model, prompt_ids, counterfactual_prompt_ids, generated_ids
+)
 rows = []
-for index, group in enumerate(groups):
-    score = compute_directional_sensitivity(
-        model, full_ids, len(prompt_ids), group["positions"]
+for token_index, group in enumerate(groups):
+    indices = group["token_indices"]
+    original_logprob = sum(logprobs["original_token_logprobs"][i].item() for i in indices)
+    counterfactual_logprob = sum(
+        logprobs["counterfactual_token_logprobs"][i].item() for i in indices
     )
-    alignment = score["alignment_score"]
-    assert math.isfinite(alignment)
-    assert -1.0 <= alignment <= 1.0
+    delta_logprob = original_logprob - counterfactual_logprob
     rows.append({
-        "token_index_in_answer": index,
+        "generated_text": sentence,
+        "token_index_in_answer": token_index,
         "token": group["token"],
-        "alignment_score": alignment,
-        "grounding_strength": grounding_strength(alignment, 0.1),
+        "evidence_span": "example evidence",
+        "original_logprob": original_logprob,
+        "counterfactual_logprob": counterfactual_logprob,
+        "delta_logprob": delta_logprob,
+        "classification": classify_input_dependence(delta_logprob, 0.1),
     })
 
-assert grounding_strength(-0.5, 0.2) == "strong"
-assert grounding_strength(-0.05, 0.2) == "weak"
-assert "hallucination" not in rows[0]
+assert classify_input_dependence(0.5, 0.1) == "strong_input_dependence"
+assert classify_input_dependence(-0.5, 0.1) == "negative_input_dependence"
+assert classify_input_dependence(0.05, 0.1) == "weak_input_dependence"
+assert all(row["generated_text"] == sentence for row in rows)
 
 buffer = io.StringIO()
 writer = csv.DictWriter(buffer, fieldnames=list(rows[0]))
 writer.writeheader()
 writer.writerows(rows)
 buffer.seek(0)
-assert len(list(csv.DictReader(buffer))) == 2
+read_back = list(csv.DictReader(buffer))
+assert len(read_back) == 2
+assert read_back[0]["generated_text"] == sentence
+assert {"evidence_span", "original_logprob", "counterfactual_logprob",
+        "delta_logprob", "classification"}.issubset(read_back[0])
 
-print("Content-word alignment smoke test passed:", rows)
+print("Grouped counterfactual score smoke test passed:", rows)

@@ -1,46 +1,45 @@
-"""Input-embedding directional sensitivity for generated semantic tokens."""
+"""Counterfactual conditional log-probabilities for generated tokens."""
 
 import torch
-import torch.nn.functional as F
 
 from model_utils import input_device
 
 
-def compute_directional_sensitivity(model, full_ids: torch.Tensor,
-                                    prompt_len: int,
-                                    token_positions: list[int]) -> dict:
-    """Score a semantic token represented by one or more generated sub-tokens.
-
-    The scalar target is the sum of its constituent next-token logits. Its
-    gradient is compared with the concatenated prompt-embedding direction.
-    The signed cosine is returned unchanged; its sign is not a hallucination
-    label.
-    """
-    if not token_positions:
-        raise ValueError("token_positions must contain at least one generated position")
-    if prompt_len <= 0 or any(position <= 0 for position in token_positions):
-        raise ValueError("prompt_len and generated token positions must be positive")
-
+def _conditional_token_logprobs(model, prompt_ids: torch.Tensor,
+                               generated_ids: torch.Tensor) -> torch.Tensor:
+    """Score fixed generated tokens conditioned on a prompt and their prefix."""
     device = input_device(model)
-    full_ids = full_ids.to(device).unsqueeze(0)
-    model.zero_grad(set_to_none=True)
+    prompt_ids = prompt_ids.to(device).reshape(-1)
+    generated_ids = generated_ids.to(device).reshape(-1)
+    sequence = torch.cat((prompt_ids, generated_ids)).unsqueeze(0)
 
-    embeddings = model.get_input_embeddings()(full_ids).detach().clone()
-    embeddings.requires_grad_(True)
-    output = model(inputs_embeds=embeddings, use_cache=False)
+    with torch.no_grad():
+        logits = model(input_ids=sequence, use_cache=False).logits[0].float()
+        positions = torch.arange(
+            prompt_ids.numel() - 1,
+            prompt_ids.numel() + generated_ids.numel() - 1,
+            device=logits.device,
+        )
+        targets = generated_ids.to(logits.device)
+        return logits[positions].log_softmax(dim=-1).gather(
+            1, targets.unsqueeze(1)
+        ).squeeze(1).cpu()
 
-    input_positions = torch.tensor(token_positions, device=full_ids.device)
-    logits_positions = input_positions.to(output.logits.device)
-    target_ids = full_ids[0, input_positions].to(output.logits.device)
-    target_logits = output.logits[0, logits_positions - 1, target_ids]
-    grouped_logit = target_logits.sum()
-    gradient = torch.autograd.grad(grouped_logit, embeddings)[0][0, :prompt_len]
-    input_direction = embeddings.detach()[0, :prompt_len]
 
-    alignment = F.cosine_similarity(
-        gradient.reshape(1, -1), input_direction.reshape(1, -1), dim=1
-    ).item()
+def compute_counterfactual_logprobs(model, original_prompt_ids: torch.Tensor,
+                                    counterfactual_prompt_ids: torch.Tensor,
+                                    generated_ids: torch.Tensor) -> dict:
+    """Score the same generated sequence under original and altered prompts.
+
+    Because each output position is causally masked, each subtoken's score is
+    conditioned only on the prompt and the unchanged generated prefix before
+    that subtoken, not on later generated tokens.
+    """
+    original = _conditional_token_logprobs(model, original_prompt_ids, generated_ids)
+    counterfactual = _conditional_token_logprobs(
+        model, counterfactual_prompt_ids, generated_ids
+    )
     return {
-        "target_logit": grouped_logit.detach().item(),
-        "alignment_score": alignment,
+        "original_token_logprobs": original,
+        "counterfactual_token_logprobs": counterfactual,
     }
