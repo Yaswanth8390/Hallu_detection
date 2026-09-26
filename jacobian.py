@@ -56,7 +56,22 @@ def compute_layerwise_jacobian(model, full_ids: torch.Tensor, positions: List[in
     for p in positions:
         model.zero_grad(set_to_none=True)
 
-        out = model(full_ids, output_hidden_states=True, use_cache=False)
+        # Build inputs_embeds explicitly and force requires_grad on THAT
+        # tensor, rather than passing full_ids (token ids) straight into the
+        # model. This matters because model_utils.load_model freezes every
+        # model parameter (to avoid allocating a full weight-sized gradient
+        # buffer on every backward -- the actual fix for the OOM you hit).
+        # With every weight frozen, model(full_ids, ...) would produce a
+        # graph where nothing requires grad at all (int token ids aren't
+        # differentiable, and a frozen embedding matrix wouldn't make its
+        # output require grad either), and .backward() would fail outright.
+        # Making inputs_embeds itself a requires_grad leaf sidesteps that:
+        # every downstream hidden state requires grad because of THIS
+        # tensor, regardless of which weights are frozen.
+        embed_layer = model.get_input_embeddings()
+        inputs_embeds = embed_layer(full_ids).detach().clone().requires_grad_(True)
+
+        out = model(inputs_embeds=inputs_embeds, output_hidden_states=True, use_cache=False)
         hidden_states = out.hidden_states  # tuple, len = num_layers+1
         for hs in hidden_states:
             hs.retain_grad()

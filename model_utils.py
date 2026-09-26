@@ -48,6 +48,16 @@ def load_model(dtype: torch.dtype = torch.bfloat16, device: str = "cuda", load_i
     if device_map is None:
         model.to(device)
     model.eval()
+
+    # We only ever need gradients w.r.t. hidden states (via retain_grad in
+    # jacobian.py/grounding.py), never w.r.t. the model's own weights. Without
+    # this, every backward() call also allocates and stores a full gradient
+    # buffer for all 7B parameters (~same size as the weights themselves),
+    # which is very likely what's causing backward-pass OOMs even after
+    # splitting weights across GPUs -- freezing removes that waste entirely.
+    for p in model.parameters():
+        p.requires_grad_(False)
+
     return model, tokenizer
 
 
