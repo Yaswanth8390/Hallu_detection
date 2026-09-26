@@ -106,7 +106,9 @@ def generate_answer(model, tokenizer, question: str, device: str = "cuda",
         pad_token_id=tokenizer.eos_token_id,
     )
     gen_ids = out[0, prompt_ids.shape[1]:]
-    gen_text = tokenizer.decode(gen_ids, skip_special_tokens=True)
+    gen_text = tokenizer.decode(
+        gen_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
+    )
 
     return GenerationResult(
         prompt=prompt,
