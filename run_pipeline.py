@@ -74,6 +74,11 @@ def main():
                     counterfactual_prompt_ids = tokenizer(
                         counterfactual_prompt, return_tensors="pt"
                     ).input_ids[0]
+                    if counterfactual_prompt_ids.tolist() == generation.prompt_ids.tolist():
+                        raise RuntimeError(
+                            f"Removing evidence span {evidence['text']!r} did not change "
+                            "the prompt token IDs; refusing to report a no-op counterfactual."
+                        )
                     counterfactual_cache[span_key] = compute_counterfactual_logprobs(
                         model, generation.prompt_ids, counterfactual_prompt_ids,
                         generation.generated_ids,

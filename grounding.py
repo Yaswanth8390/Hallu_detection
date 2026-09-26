@@ -121,8 +121,10 @@ def select_semantic_evidence_spans(model, tokenizer, prompt_text: str,
             if prompt_positions:
                 candidates.append({
                     "text": question[local_start:local_end],
-                    "start": char_start,
-                    "end": char_end,
+                    "start": local_start,
+                    "end": local_end,
+                    "prompt_start": char_start,
+                    "prompt_end": char_end,
                     "prompt_positions": prompt_positions,
                 })
     if not candidates:

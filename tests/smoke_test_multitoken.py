@@ -99,6 +99,14 @@ semantic_match = select_semantic_evidence_spans(
 )[0]
 assert semantic_match["text"] == "1984"
 assert semantic_match["similarity"] > 0.99
+counterfactual_question = (
+    semantic_question[:semantic_match["start"]]
+    + semantic_question[semantic_match["end"]:]
+)
+assert counterfactual_question == "Who wrote ?"
+assert counterfactual_question != semantic_question
+assert (semantic_prompt.replace(semantic_question, counterfactual_question, 1)
+        != semantic_prompt)
 tiny_model_match = select_semantic_evidence_spans(
     model,
     semantic_tokenizer,
@@ -113,6 +121,10 @@ assert -1.0 <= tiny_model_match["similarity"] <= 1.0
 
 logprobs = compute_counterfactual_logprobs(
     model, prompt_ids, counterfactual_prompt_ids, generated_ids
+)
+assert not torch.equal(
+    logprobs["original_token_logprobs"],
+    logprobs["counterfactual_token_logprobs"],
 )
 rows = []
 for token_index, group in enumerate(groups):
