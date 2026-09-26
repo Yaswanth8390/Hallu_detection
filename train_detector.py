@@ -1,4 +1,4 @@
-"""Train a token-level Logistic Regression detector on generated feature rows."""
+"""Train token scores with answer-level max-pooling logistic regression."""
 
 import argparse
 import csv
@@ -7,10 +7,9 @@ import json
 import joblib
 import numpy as np
 import torch
-from sklearn.linear_model import LogisticRegression
+import torch.nn.functional as F
 from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
-from sklearn.model_selection import GroupShuffleSplit
-from sklearn.pipeline import make_pipeline
+from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
 from model_utils import MODEL_NAME
@@ -56,8 +55,86 @@ def load_training_rows(path: str):
     return rows
 
 
+def answer_groups(group_ids, labels):
+    """Return row-index groups and one consistent weak label per answer."""
+    grouped_rows = {}
+    grouped_labels = {}
+    for index, (group_id, label) in enumerate(zip(group_ids, labels)):
+        group_key = str(group_id)
+        if group_key in grouped_labels and grouped_labels[group_key] != label:
+            raise ValueError(f"Answer {group_key!r} has inconsistent token labels")
+        grouped_labels[group_key] = int(label)
+        grouped_rows.setdefault(group_key, []).append(index)
+    return (
+        list(grouped_rows.values()),
+        np.asarray([grouped_labels[key] for key in grouped_rows], dtype=np.int64),
+    )
+
+
+def fit_max_pool_logistic_regression(X: np.ndarray, y: np.ndarray,
+                                     groups: list[np.ndarray],
+                                     regularization: float = 1.0,
+                                     max_iter: int = 300) -> tuple[np.ndarray, float]:
+    """Fit token logits while optimizing BCE on each answer's maximum logit.
+
+    This is a linear logistic detector with HARP's multiple-instance objective:
+    each answer score is the maximum of its content-token scores. Answer labels
+    supervise the pooled score; they are not treated as token annotations.
+    """
+    if regularization <= 0:
+        raise ValueError("regularization must be positive")
+    if max_iter < 1:
+        raise ValueError("max_iter must be positive")
+    if len(np.unique(y)) != 2:
+        raise ValueError("Training requires both binary answer-label classes")
+    if len(groups) != len(y):
+        raise ValueError("There must be exactly one token-index group per answer label")
+
+    features = torch.as_tensor(X, dtype=torch.float64)
+    labels = torch.as_tensor(y, dtype=torch.float64)
+    group_indices = [
+        torch.as_tensor(group, dtype=torch.long) for group in groups
+    ]
+    class_counts = torch.bincount(labels.to(torch.long), minlength=2).to(torch.float64)
+    class_weights = len(y) / (2.0 * class_counts)
+    sample_weights = class_weights[labels.to(torch.long)]
+
+    weights = torch.nn.Parameter(torch.zeros(X.shape[1], dtype=torch.float64))
+    bias = torch.nn.Parameter(torch.zeros((), dtype=torch.float64))
+    optimizer = torch.optim.LBFGS(
+        [weights, bias], max_iter=max_iter, line_search_fn="strong_wolfe"
+    )
+
+    def closure():
+        optimizer.zero_grad()
+        token_logits = features @ weights + bias
+        answer_logits = torch.stack([
+            token_logits[index].max() for index in group_indices
+        ])
+        losses = F.binary_cross_entropy_with_logits(
+            answer_logits, labels, reduction="none"
+        )
+        loss = (losses * sample_weights).mean()
+        loss = loss + 0.5 * regularization * weights.square().sum()
+        loss.backward()
+        return loss
+
+    optimizer.step(closure)
+    return weights.detach().numpy(), float(bias.detach().item())
+
+
+def token_probabilities(detector: dict, X: np.ndarray) -> np.ndarray:
+    if X.size == 0:
+        return np.asarray([], dtype=np.float64)
+    standardized = detector["scaler"].transform(X)
+    logits = standardized @ detector["weights"] + detector["bias"]
+    logits = np.clip(logits, -700.0, 700.0)
+    return 1.0 / (1.0 + np.exp(-logits))
+
+
 def train_detector(data_path: str, basis_path: str, model_path: str,
-                   test_size: float = 0.2, random_state: int = 42):
+                   test_size: float = 0.2, random_state: int = 42,
+                   regularization: float = 1.0, max_iter: int = 300):
     rows = load_training_rows(data_path)
     with open(basis_path, "rb") as basis_file:
         basis_record = torch.load(basis_file, map_location="cpu", weights_only=True)
@@ -74,44 +151,76 @@ def train_detector(data_path: str, basis_path: str, model_path: str,
         y = np.asarray([int(row["label"]) for row in rows], dtype=np.int64)
     except ValueError as error:
         raise ValueError("Labels must be integers 0 (supported) or 1 (hallucinated)") from error
-    if not np.isin(y, [0, 1]).all() or len(np.unique(y)) != 2:
-        raise ValueError("Training requires both binary label classes, encoded as 0 and 1")
-
-    groups = np.asarray([row["example_index"] for row in rows])
-    if len(np.unique(groups)) < 2:
-        raise ValueError("At least two distinct examples are needed for group-held-out validation")
-    splitter = GroupShuffleSplit(
-        n_splits=1, test_size=test_size, random_state=random_state
+    if not np.isin(y, [0, 1]).all():
+        raise ValueError("Labels must be encoded as 0 or 1")
+    groups, answer_labels = answer_groups(
+        [row["example_index"] for row in rows], y
     )
-    train_indices, test_indices = next(splitter.split(X, y, groups))
-    if len(np.unique(y[train_indices])) < 2:
-        raise ValueError("The training split contains only one label class; add more examples")
+    if len(np.unique(answer_labels)) != 2:
+        raise ValueError("Training requires both binary answer-label classes")
+    if min(np.bincount(answer_labels, minlength=2)) < 2:
+        raise ValueError("At least two distinct answers per label class are needed for validation")
 
-    classifier = make_pipeline(
-        StandardScaler(),
-        LogisticRegression(class_weight="balanced", max_iter=2000, random_state=random_state),
+    train_answers, test_answers = train_test_split(
+        np.arange(len(groups)),
+        test_size=test_size,
+        random_state=random_state,
+        stratify=answer_labels,
     )
-    classifier.fit(X[train_indices], y[train_indices])
-    test_probabilities = classifier.predict_proba(X[test_indices])[:, 1]
-    test_predictions = (test_probabilities >= 0.5).astype(np.int64)
-    print(f"Held-out examples: {len(np.unique(groups[test_indices]))}")
-    print(f"Held-out token rows: {len(test_indices)}")
-    print(f"Accuracy: {accuracy_score(y[test_indices], test_predictions):.3f}")
-    print(f"F1: {f1_score(y[test_indices], test_predictions, zero_division=0):.3f}")
-    if len(np.unique(y[test_indices])) == 2:
-        print(f"ROC-AUC: {roc_auc_score(y[test_indices], test_probabilities):.3f}")
+    train_rows = np.concatenate([groups[index] for index in train_answers])
+    test_rows = np.concatenate([groups[index] for index in test_answers])
+    scaler = StandardScaler().fit(X[train_rows])
+    scaled_X = scaler.transform(X)
+
+    train_groups = [groups[index] for index in train_answers]
+    train_labels = answer_labels[train_answers]
+    train_X = scaled_X[train_rows]
+    local_groups = []
+    offset = 0
+    for group in train_groups:
+        local_groups.append(np.arange(offset, offset + len(group)))
+        offset += len(group)
+    weights, bias = fit_max_pool_logistic_regression(
+        train_X, train_labels, local_groups, regularization, max_iter
+    )
+
+    heldout_token_probs = 1.0 / (
+        1.0 + np.exp(-np.clip(scaled_X[test_rows] @ weights + bias, -700, 700))
+    )
+    heldout_group_probs = []
+    for answer_index in test_answers:
+        heldout_group_probs.append(float(heldout_token_probs[
+            np.isin(test_rows, groups[answer_index])
+        ].max()))
+    test_labels = answer_labels[test_answers]
+    test_predictions = (np.asarray(heldout_group_probs) >= 0.5).astype(np.int64)
+    print(f"Held-out examples: {len(test_answers)}")
+    print(f"Held-out token rows: {len(test_rows)}")
+    print(f"Answer-level accuracy: {accuracy_score(test_labels, test_predictions):.3f}")
+    print(f"Answer-level F1: {f1_score(test_labels, test_predictions, zero_division=0):.3f}")
+    if len(np.unique(test_labels)) == 2:
+        print(f"Answer-level ROC-AUC: {roc_auc_score(test_labels, heldout_group_probs):.3f}")
     else:
-        print("ROC-AUC: unavailable (held-out split has one label class)")
+        print("Answer-level ROC-AUC: unavailable (held-out split has one label class)")
 
-    classifier.fit(X, y)
-    joblib.dump({
-        "classifier": classifier,
+    full_scaler = StandardScaler().fit(X)
+    full_X = full_scaler.transform(X)
+    full_weights, full_bias = fit_max_pool_logistic_regression(
+        full_X, answer_labels, groups, regularization, max_iter
+    )
+    detector = {
+        "scaler": full_scaler,
+        "weights": full_weights,
+        "bias": full_bias,
         "model_name": MODEL_NAME,
         "reasoning_basis": reasoning_basis,
         "harp_feature_size": reasoning_basis.shape[1],
         "decision_threshold": 0.5,
-    }, model_path)
-    print(f"Saved token-level detector to {model_path}")
+        "training_objective": "answer_level_max_pool_binary_cross_entropy",
+        "training_answers": len(groups),
+    }
+    joblib.dump(detector, model_path)
+    print(f"Saved max-pooled token detector to {model_path}")
 
 
 def main():
@@ -121,10 +230,20 @@ def main():
     parser.add_argument("--out", type=str, default="token_detector.joblib")
     parser.add_argument("--test-size", type=float, default=0.2)
     parser.add_argument("--random-state", type=int, default=42)
+    parser.add_argument("--regularization", type=float, default=1.0,
+                        help="L2 penalty strength for the logistic detector")
+    parser.add_argument("--max-iter", type=int, default=300)
     args = parser.parse_args()
     if not 0.0 < args.test_size < 1.0:
         parser.error("--test-size must be between 0 and 1")
-    train_detector(args.data, args.harp_basis, args.out, args.test_size, args.random_state)
+    if args.regularization <= 0.0:
+        parser.error("--regularization must be positive")
+    if args.max_iter < 1:
+        parser.error("--max-iter must be positive")
+    train_detector(
+        args.data, args.harp_basis, args.out, args.test_size,
+        args.random_state, args.regularization, args.max_iter,
+    )
 
 
 if __name__ == "__main__":

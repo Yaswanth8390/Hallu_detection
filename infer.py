@@ -10,7 +10,7 @@ import torch
 from grounding import content_word_groups, load_content_tagger
 from model_utils import MODEL_NAME, generate_answer, load_model
 from token_features import extract_token_features
-from train_detector import feature_vector
+from train_detector import feature_vector, token_probabilities
 
 
 def main():
@@ -34,6 +34,11 @@ def main():
             f"Detector expects {detector['model_name']!r}, but this inference script "
             f"loads {MODEL_NAME!r}"
         )
+    if detector.get("training_objective") != "answer_level_max_pool_binary_cross_entropy":
+        raise ValueError(
+            "Detector was not trained with the answer-level max-pooling objective; "
+            "retrain it with the current train_detector.py before inference."
+        )
     reasoning_basis = torch.as_tensor(detector["reasoning_basis"])
     if reasoning_basis.shape[1] != detector["harp_feature_size"]:
         raise ValueError("Detector HARP metadata does not match its saved projection basis")
@@ -52,16 +57,19 @@ def main():
     )
 
     records = []
+    feature_vectors = []
     for feature in features:
         row = {
             "counterfactual_score": feature["counterfactual_score"],
             "semantic_similarity": feature["semantic_similarity"],
             "HARP_features": json.dumps(feature["HARP_features"]),
         }
-        vector = feature_vector(row, expected_harp_size=detector["harp_feature_size"])
-        probability = float(detector["classifier"].predict_proba(
-            np.asarray([vector])
-        )[0, 1])
+        feature_vectors.append(
+            feature_vector(row, expected_harp_size=detector["harp_feature_size"])
+        )
+
+    probabilities = token_probabilities(detector, np.asarray(feature_vectors))
+    for feature, probability in zip(features, probabilities):
         records.append({
             "token": feature["token"],
             "char_start": feature["char_start"],
@@ -69,13 +77,16 @@ def main():
             "evidence_span": feature["evidence_span"],
             "counterfactual_score": feature["counterfactual_score"],
             "semantic_similarity": feature["semantic_similarity"],
-            "hallucination_probability": probability,
+            "hallucination_probability": float(probability),
             "flagged": probability >= args.threshold,
         })
 
+    answer_probability = float(max(probabilities, default=0.0))
     print(json.dumps({
         "generated_text": generation.generated_text,
         "content_token_predictions": records,
+        "answer_hallucination_probability": answer_probability,
+        "answer_flagged": answer_probability >= args.threshold,
         "threshold": args.threshold,
     }, ensure_ascii=False, indent=2))
 

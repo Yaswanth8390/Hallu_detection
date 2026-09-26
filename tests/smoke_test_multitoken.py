@@ -183,7 +183,8 @@ assert torch.all(confidence["margin"] >= 0)
 reasoning_basis = build_reasoning_basis(model, semantic_fraction=0.75)
 assert reasoning_basis.shape == (64, 16)
 assert torch.allclose(
-    reasoning_basis.T @ reasoning_basis, torch.eye(16), atol=1e-5
+    reasoning_basis.T @ reasoning_basis,
+    torch.eye(16, dtype=reasoning_basis.dtype), atol=1e-5
 )
 harp_vectors = project_content_tokens(
     model, prompt_ids, generated_ids, groups, reasoning_basis

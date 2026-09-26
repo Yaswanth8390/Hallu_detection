@@ -30,11 +30,11 @@ def build_reasoning_basis(model, semantic_fraction: float = 0.95,
     if semantic_rank < 1 or reasoning_size < 1:
         raise ValueError("The semantic and reasoning subspaces must both be non-empty")
 
-    gram = torch.zeros(
-        (hidden_size, hidden_size), dtype=torch.float32, device=weight.device
-    )
+    gram = torch.zeros((hidden_size, hidden_size), dtype=torch.float64, device="cpu")
     for start in range(0, weight.shape[0], row_chunk_size):
-        chunk = weight[start:start + row_chunk_size].to(dtype=torch.float32)
+        chunk = weight[start:start + row_chunk_size].to(
+            device="cpu", dtype=torch.float64
+        )
         gram.addmm_(chunk.transpose(0, 1), chunk)
 
     _, eigenvectors = torch.linalg.eigh(gram)

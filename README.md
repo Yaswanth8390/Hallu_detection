@@ -16,7 +16,9 @@ token-offset, and label-source metadata.
 HARP features follow the paper's reasoning-subspace projection formulation:
 the output/unembedding weight is decomposed through its hidden-dimension Gram
 matrix; the semantic rank is `k = floor(0.95 * hidden_size)`, and the remaining
-lowest-singular-value right-singular vectors form `V_R`. For the causal hidden
+lowest-singular-value right-singular vectors form `V_R`. The unembedding
+Gram matrix is accumulated and diagonalized in CPU float64 to better preserve
+the low-energy directions while avoiding another large GPU allocation. For the causal hidden
 state `h_t` that predicts each generated subtoken, the feature is
 `V_R.T @ h_t`. A content word split into multiple model subtokens receives the
 mean of those per-subtoken projections. The basis is saved to
@@ -31,12 +33,17 @@ semantic similarity by itself determines whether a token is hallucinated.
 The classifier learns from all of these features together with HARP features.
 
 TruthfulQA does not supply token-level hallucination annotations. Consequently
-`label` is a weak proxy: the existing answer-level lexical-overlap correctness
+`label` is a weak answer-level proxy: the existing lexical-overlap correctness
 heuristic is copied to every content word in that answer
 (`1 = answer heuristic says incorrect`, `0 = says correct`). This limitation
-is recorded in `label_source`; the detector's output should not be treated as
-token-ground-truth performance until trained/evaluated with genuine token
-annotations.
+is recorded in `label_source`. The trainer does not treat that repeated label
+as a token annotation: it learns linear token logits using binary cross-entropy
+on the maximum token logit per answer, matching HARP's answer-level
+max-pooling formulation. This encourages at least one high-scoring content
+token in a weakly labeled hallucinated answer and low scores across a labeled
+supported answer. Individual token probabilities remain weakly supervised and
+must not be presented as token-ground-truth performance until trained and
+evaluated with genuine token annotations.
 
 ## Setup and dataset generation
 
@@ -58,9 +65,11 @@ disable it. Use `--content-tagger` to select a different installed spaCy model.
 
 ## Train and infer
 
-Train Logistic Regression from the generated rows. Validation splits are
-grouped by answer/example to prevent token rows from the same answer leaking
-across the held-out split; the final saved estimator is then fit on all rows.
+Train a max-pooled linear Logistic Regression head from the generated rows.
+Validation splits are stratified and grouped by answer/example to prevent
+token rows from the same answer leaking across the held-out split. Reported
+accuracy, F1, and ROC-AUC are answer-level metrics, consistent with the weak
+answer-level labels; the final saved estimator is then fit on all rows.
 
 ```sh
 python train_detector.py --data results_tokens.csv \
@@ -88,4 +97,5 @@ the target model:
 ```sh
 python tests/smoke_test.py
 python tests/smoke_test_multitoken.py
+python tests/smoke_test_training.py
 ```
