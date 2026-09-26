@@ -1,198 +1,171 @@
 """
-Evaluate whether the Jacobian trajectory + grounding features from
-run_pipeline.py actually separate correct answers from hallucinated ones.
+Benchmark run_pipeline.py's per-word hallucination_label against TruthfulQA's
+own lexical-overlap correctness heuristic (dataset.label_correctness), used
+here as a noisy stand-in for ground truth (hallucinated == NOT correct).
 
-This is the "does it work" script: it doesn't just dump features, it reports
-concrete numbers you can look at and be skeptical of --
-  - per-feature correlation with the hallucination label (which single
-    features carry signal, if any)
-  - a simple logistic-regression classifier's held-out accuracy / ROC-AUC
-    using ALL features together, vs. a majority-class baseline
-  - a confusion matrix so you can see the failure pattern, not just one number
+This expects a CSV from the *current* run_pipeline.py -- one that stamps
+`example_index`, `hallucination_label`, and `is_correct_heuristic` onto every
+row. It will refuse to run against an older results CSV that doesn't have
+these columns rather than silently computing nonsense.
 
-Run against real output:
-    python evaluate.py --in results.csv
+Per-word labels are rolled up to one prediction per TruthfulQA question by
+the fraction of that answer's words flagged `hallucination`. The rollup
+threshold (--flag-fraction-threshold) is another knob that needs calibrating,
+same as the pipeline's own --dependence-threshold / --entropy-threshold.
 
-Run against a synthetic sanity-check CSV (no GPU/model needed) to confirm
-this script's own logic is correct before trusting it on real results:
-    python evaluate.py --synthetic
+Run:
+    python evaluate.py --in results_tokens.csv
 """
 
 import argparse
 import csv
-import random
-from typing import List
+from collections import defaultdict
+from typing import Dict, List
 
 import numpy as np
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, confusion_matrix, roc_auc_score
-from sklearn.model_selection import train_test_split
-from sklearn.dummy import DummyClassifier
+from sklearn.metrics import (
+    accuracy_score,
+    confusion_matrix,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
 
-# Columns that are inputs to the model, not metadata/text.
-FEATURE_COLUMNS = [
-    "grad_norm_final_layer", "grad_norm_mean", "grad_norm_max",
-    "grad_norm_argmax_layer_frac", "late_to_early_ratio",
-    "grad_grounding_fraction", "grad_entity_to_other_ratio",
-    "ablate_logit_drop", "ablate_rank_worsened_by",
-]
-LABEL_COLUMN = "is_correct_heuristic"
+REQUIRED_COLUMNS = {
+    "example_index", "question", "generated_text",
+    "hallucination_label", "is_correct_heuristic",
+}
 
 
 def load_rows(path: str) -> List[dict]:
     with open(path) as f:
-        return list(csv.DictReader(f))
+        rows = list(csv.DictReader(f))
+    if rows and not REQUIRED_COLUMNS.issubset(rows[0]):
+        missing = sorted(REQUIRED_COLUMNS - set(rows[0]))
+        raise ValueError(
+            f"{path} is missing columns {missing}. This script expects output "
+            "from the current run_pipeline.py (with example_index, "
+            "hallucination_label, is_correct_heuristic, etc.), not an older "
+            "or partial results CSV."
+        )
+    return rows
 
 
-def rows_to_xy(rows: List[dict]):
-    """Keep only rows that have every feature populated (some rows may lack
-    grounding features if an entity span wasn't found) and a valid label.
+def group_by_example(rows: List[dict]) -> Dict[str, List[dict]]:
+    groups = defaultdict(list)
+    for row in rows:
+        groups[row["example_index"]].append(row)
+    return groups
+
+
+def example_summary(group: List[dict]) -> dict:
+    """Roll up one TruthfulQA example's word rows into a single prediction
+    (flagged-word fraction) and ground-truth label.
     """
-    X, y, kept = [], [], []
-    for r in rows:
-        if LABEL_COLUMN not in r or r[LABEL_COLUMN] == "":
-            continue
-        try:
-            feats = [float(r[c]) for c in FEATURE_COLUMNS]
-        except (KeyError, ValueError):
-            continue  # missing grounding features for this row -- skip it
-        X.append(feats)
-        # label = 1 means HALLUCINATED (i.e. NOT correct), so the classifier
-        # target is "detect hallucination", matching the problem statement.
-        y.append(0 if r[LABEL_COLUMN].strip().lower() == "true" else 1)
-        kept.append(r)
-    return np.array(X), np.array(y), kept
+    n_words = len(group)
+    n_flagged = sum(1 for row in group if row["hallucination_label"] == "hallucination")
+    flagged_fraction = n_flagged / n_words if n_words else 0.0
+    # is_correct_heuristic is constant across a group's rows -- it's an
+    # answer-level label attached to every word row at generation time.
+    is_correct = group[0]["is_correct_heuristic"].strip().lower() == "true"
+    return {
+        "question": group[0]["question"],
+        "generated_text": group[0]["generated_text"],
+        "n_words": n_words,
+        "n_flagged": n_flagged,
+        "flagged_fraction": flagged_fraction,
+        "ground_truth_hallucinated": not is_correct,
+    }
 
 
-def point_biserial_correlations(X: np.ndarray, y: np.ndarray) -> List[tuple]:
-    """Correlation of each feature with the binary hallucination label --
-    the cheapest possible check of "is there any signal at all here".
-    """
-    out = []
-    for i, name in enumerate(FEATURE_COLUMNS):
-        col = X[:, i]
-        if np.std(col) < 1e-12:
-            out.append((name, 0.0))
-            continue
-        corr = np.corrcoef(col, y)[0, 1]
-        out.append((name, corr))
-    return sorted(out, key=lambda t: abs(t[1]), reverse=True)
+def report(summaries: List[dict], flag_fraction_threshold: float):
+    y_true = np.array([1 if s["ground_truth_hallucinated"] else 0 for s in summaries])
+    scores = np.array([s["flagged_fraction"] for s in summaries])
+    y_pred = (scores > flag_fraction_threshold).astype(int)
 
+    print(f"\n=== Answer-level hallucination benchmark (n={len(summaries)}) ===")
+    print(f"  Ground-truth hallucination rate "
+          f"(TruthfulQA lexical-overlap heuristic): {y_true.mean():.2f}")
+    print(f"  Predicted hallucination rate "
+          f"(>{flag_fraction_threshold:.2f} of an answer's words flagged): "
+          f"{y_pred.mean():.2f}")
 
-def evaluate(X: np.ndarray, y: np.ndarray, seed: int = 0):
-    if len(set(y.tolist())) < 2:
-        print("Only one class present in the labels -- can't evaluate discrimination. "
-              "You likely need more/more-varied examples (TruthfulQA is designed to "
-              "elicit false answers, so a mix is expected with enough examples).")
+    if len(set(y_true.tolist())) < 2:
+        print("\nOnly one ground-truth class present in this sample -- "
+              "TruthfulQA's own heuristic called every answer the same way. "
+              "Precision/recall/ROC-AUC aren't meaningful here; try a larger "
+              "--n from run_pipeline.py (TruthfulQA is designed to elicit a "
+              "mix of correct and incorrect answers, but small samples can "
+              "still land on one side).")
         return
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.3, random_state=seed, stratify=y if min(np.bincount(y)) > 1 else None
-    )
-
-    clf = LogisticRegression(max_iter=1000, class_weight="balanced")
-    clf.fit(X_train, y_train)
-    preds = clf.predict(X_test)
-    probs = clf.predict_proba(X_test)[:, 1]
-
-    baseline = DummyClassifier(strategy="most_frequent")
-    baseline.fit(X_train, y_train)
-    baseline_preds = baseline.predict(X_test)
-
-    print("\n=== Feature correlations with hallucination label (|r|, sorted) ===")
-    for name, corr in point_biserial_correlations(X, y):
-        print(f"  {name:32s} r={corr:+.3f}")
-
-    print("\n=== Classifier (all features) vs. majority-class baseline ===")
-    print(f"  Baseline accuracy (always predict majority class): "
-          f"{accuracy_score(y_test, baseline_preds):.3f}")
-    print(f"  Logistic regression accuracy:                      "
-          f"{accuracy_score(y_test, preds):.3f}")
+    print(f"\n  Accuracy:  {accuracy_score(y_true, y_pred):.3f}")
+    print(f"  Precision: {precision_score(y_true, y_pred, zero_division=0):.3f}")
+    print(f"  Recall:    {recall_score(y_true, y_pred, zero_division=0):.3f}")
+    print(f"  F1:        {f1_score(y_true, y_pred, zero_division=0):.3f}")
     try:
-        print(f"  Logistic regression ROC-AUC:                       "
-              f"{roc_auc_score(y_test, probs):.3f}  (0.5 = no signal, 1.0 = perfect)")
+        print(f"  ROC-AUC (flagged-word fraction as score): "
+              f"{roc_auc_score(y_true, scores):.3f}  (0.5 = no signal, 1.0 = perfect)")
     except ValueError:
-        print("  ROC-AUC undefined for this split (likely too few test examples of one class).")
+        print("  ROC-AUC undefined for this sample (too few examples of one class).")
 
-    print("\n=== Confusion matrix (rows=true, cols=predicted; 0=correct, 1=hallucinated) ===")
-    print(confusion_matrix(y_test, preds))
+    print("\n  Confusion matrix (rows=ground truth, cols=predicted; "
+          "0=not-hallucinated, 1=hallucinated):")
+    print(confusion_matrix(y_true, y_pred))
 
-    print(f"\n  n_train={len(y_train)}  n_test={len(y_test)}  "
-          f"hallucination_rate={y.mean():.2f}")
-    print("\nRead this skeptically: with typical pilot sizes (tens of examples), "
-          "these numbers have wide error bars. Look at whether the SAME features "
-          "come out on top across a few different random seeds / larger n before "
-          "believing the ranking.")
+    print("\nRead this skeptically for two independent reasons: (1) TruthfulQA's "
+          "own lexical-overlap 'ground truth' is a rough heuristic, not human "
+          "judgment -- see dataset.py's label_correctness docstring, and it "
+          "will disagree with a careful human reader on plenty of answers. "
+          "(2) --flag-fraction-threshold here and --dependence-threshold / "
+          "--entropy-threshold in run_pipeline.py all need separate "
+          "calibration; a single accuracy number from one threshold "
+          "combination is not a finished benchmark.")
 
 
-def make_synthetic_csv(path: str, n: int = 200, signal_strength: float = 1.2, seed: int = 0):
-    """Generate a fake results.csv with a KNOWN, controllable signal, so you can
-    confirm evaluate.py's own logic (correlation calc, classifier, metrics) is
-    correct before spending GPU time on the real pipeline. `grounding_fraction`
-    is made informative by construction; the rest are noise. If evaluate.py
-    can't recover that signal here, the bug is in evaluate.py, not in your model.
-    """
-    rng = random.Random(seed)
-    rows = []
-    for _ in range(n):
-        hallucinated = rng.random() < 0.5
-        # Informative feature: lower grounding fraction for hallucinated examples,
-        # with noise -- this is the effect we HOPE the real pipeline shows.
-        grounding_fraction = rng.gauss(0.15 if hallucinated else 0.15 + signal_strength * 0.2, 0.15)
-        grounding_fraction = min(max(grounding_fraction, 0.0), 1.0)
-        row = {
-            "question": "synthetic question",
-            "generated_text": "synthetic answer",
-            "candidate_entity": "Entity",
-            "grad_norm_final_layer": rng.gauss(0, 1),
-            "grad_norm_mean": rng.gauss(0, 1),
-            "grad_norm_max": rng.gauss(0, 1),
-            "grad_norm_argmax_layer_frac": rng.random(),
-            "late_to_early_ratio": rng.gauss(1, 0.3),
-            "grad_grounding_fraction": grounding_fraction,
-            "grad_entity_to_other_ratio": rng.gauss(0, 1),
-            "ablate_logit_drop": rng.gauss(0, 1),
-            "ablate_rank_worsened_by": rng.gauss(0, 1),
-            "is_correct_heuristic": str(not hallucinated),
-        }
-        rows.append(row)
-
-    with open(path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-        writer.writeheader()
-        writer.writerows(rows)
-    return rows
+def show_disagreements(summaries: List[dict], flag_fraction_threshold: float, n: int):
+    if n <= 0:
+        return
+    disagreements = [
+        s for s in summaries
+        if (s["flagged_fraction"] > flag_fraction_threshold) != s["ground_truth_hallucinated"]
+    ]
+    print(f"\n=== {len(disagreements)} answer-level disagreements "
+          f"(predicted != TruthfulQA-heuristic label), showing up to {n} ===")
+    for s in disagreements[:n]:
+        print(f"\nQ: {s['question']}")
+        print(f"A: {s['generated_text']}")
+        print(f"  ground_truth_hallucinated={s['ground_truth_hallucinated']}  "
+              f"flagged={s['n_flagged']}/{s['n_words']} words "
+              f"({s['flagged_fraction']:.2f})")
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--in", dest="in_path", type=str, default="results.csv")
-    parser.add_argument("--synthetic", action="store_true",
-                         help="Run against a generated sanity-check CSV instead of real results.")
-    parser.add_argument("--synthetic-signal", type=float, default=1.2,
-                         help="Signal strength for --synthetic. Set to 0 to verify the script "
-                              "correctly reports 'no signal' rather than always finding one.")
+    parser.add_argument("--in", dest="in_path", type=str, default="results_tokens.csv")
+    parser.add_argument("--flag-fraction-threshold", type=float, default=0.0,
+                         help="predict an answer hallucinated if the fraction of "
+                              "its words flagged `hallucination` exceeds this. "
+                              "0.0 (default) means 'any flagged word counts'. "
+                              "Needs calibration, same as the pipeline's own "
+                              "thresholds.")
+    parser.add_argument("--show-disagreements", type=int, default=5,
+                         help="number of answer-level disagreements to print "
+                              "(0 to skip)")
     args = parser.parse_args()
 
-    if args.synthetic:
-        path = "synthetic_results.csv"
-        make_synthetic_csv(path, signal_strength=args.synthetic_signal)
-        print(f"Generated {path} with a KNOWN synthetic signal in `grad_grounding_fraction`.\n"
-              "If the numbers below don't show that feature near the top of the "
-              "correlation ranking and an ROC-AUC well above 0.5, the bug is in "
-              "evaluate.py -- fix that before trusting real results.\n")
-    else:
-        path = args.in_path
-
-    rows = load_rows(path)
-    X, y, kept = rows_to_xy(rows)
-    print(f"Loaded {len(rows)} rows, {len(kept)} usable after dropping rows with missing "
-          f"features/labels.")
-    if len(kept) == 0:
-        print("No usable rows -- check that run_pipeline.py actually populated "
-              "grounding features (needs a found entity span) and labels.")
+    rows = load_rows(args.in_path)
+    groups = group_by_example(rows)
+    summaries = [example_summary(group) for group in groups.values()]
+    print(f"Loaded {len(rows)} token rows across {len(summaries)} answers "
+          f"from {args.in_path}.")
+    if not summaries:
+        print("No answers to evaluate.")
         return
-    evaluate(X, y)
+
+    report(summaries, args.flag_fraction_threshold)
+    show_disagreements(summaries, args.flag_fraction_threshold, args.show_disagreements)
 
 
 if __name__ == "__main__":

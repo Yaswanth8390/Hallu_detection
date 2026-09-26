@@ -12,6 +12,7 @@ from grounding import (
     classify_input_dependence,
     combine_input_dependence_and_confidence,
     content_word_groups,
+    final_hallucination_label,
     select_semantic_evidence_spans,
 )
 from jacobian import compute_counterfactual_logprobs, compute_token_confidence
@@ -172,6 +173,10 @@ assert combine_input_dependence_and_confidence(
 assert combine_input_dependence_and_confidence(
     "no_matching_evidence_span", "confident"
 ) == "parametric_knowledge"
+
+assert final_hallucination_label("possible_hallucination") == "hallucination"
+assert final_hallucination_label("parametric_knowledge") == "not_hallucination"
+assert final_hallucination_label("input_dependent") == "not_hallucination"
 
 confidence = compute_token_confidence(model, prompt_ids, generated_ids)
 assert confidence["logprob"].shape == generated_ids.shape

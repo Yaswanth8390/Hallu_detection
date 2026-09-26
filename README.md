@@ -16,7 +16,9 @@ A positive delta means the matched question span increased support for that word
 
 To separate those, each word also gets an entropy and a top1-vs-top2 log-probability margin (both in nats) from the model's *original*-prompt distribution at that position, from the same forward pass used for `original_logprob`. Low entropy / high margin means the model would likely produce this word regardless of the prompt. This is layered on top of the dependence label, not used alone: words already showing `strong_input_dependence` are left as-is (`combined_classification=input_dependent`), since the dependence signal already explains the question's role there. For the remaining words, low original-prompt entropy against `--entropy-threshold` yields `parametric_knowledge`; high entropy yields `possible_hallucination`. This still is not a correctness label — it only distinguishes "confident regardless of prompt" from "not confident and not prompt-dependent either," and the entropy threshold needs the same experimental calibration as `--dependence-threshold`.
 
-Words are grouped from tokenizer offsets so multi-subtoken words receive one row. Punctuation and a conservative list of grammatical/function words are skipped. Each row retains `generated_text` so the original generated response can be reconstructed, and includes the token, selected evidence span and its similarity, both log-probabilities, delta, dependence classification and threshold, word entropy and margin, entropy threshold, confidence classification, and the combined classification.
+Words are grouped from tokenizer offsets so multi-subtoken words receive one row. Punctuation and a conservative list of grammatical/function words are skipped. Each row retains `generated_text` so the original generated response can be reconstructed, and includes the token, selected evidence span and its similarity, both log-probabilities, delta, dependence classification and threshold, word entropy and margin, entropy threshold, confidence classification, the combined classification, and a final binary `hallucination_label` (`hallucination` iff `combined_classification` is `possible_hallucination`, otherwise `not_hallucination`).
+
+`hallucination_label` inherits every limitation above: a word the model states confidently and consistently but which is still wrong -- a contested or fabricated fact given with low entropy -- reads as `not_hallucination` here, because low entropy is read as parametric knowledge regardless of whether that knowledge is correct. Telling those apart would need something like resampling the same question and checking whether the word is stable across samples, which this label does not do.
 
 ## Run
 
@@ -34,3 +36,15 @@ The smoke tests use tiny random-initialized Qwen models and an offset-tokenizer 
 python tests/smoke_test.py
 python tests/smoke_test_multitoken.py
 ```
+
+## Benchmark
+
+Every row also carries `example_index` and a ground-truth `is_correct_heuristic` from TruthfulQA's own lexical-overlap heuristic (`dataset.label_correctness`, `--overlap-threshold`, default `0.3`) -- this is a rough heuristic, not human judgment, see that function's docstring.
+
+`evaluate.py` rolls the per-word `hallucination_label`s up to one prediction per TruthfulQA question (the fraction of that answer's words flagged `hallucination`, thresholded by `--flag-fraction-threshold`, default `0.0` = "any flagged word counts") and reports accuracy/precision/recall/F1/ROC-AUC/confusion-matrix against that ground truth, plus a handful of concrete disagreements to read by hand:
+
+```sh
+python evaluate.py --in results_tokens.csv
+```
+
+This needs a CSV from the current `run_pipeline.py` -- it refuses an older results CSV missing `example_index` / `hallucination_label` / `is_correct_heuristic` rather than silently computing nonsense. Treat any single number here as provisional: it is downstream of four independently-uncalibrated thresholds (`--dependence-threshold`, `--entropy-threshold`, `--overlap-threshold`, `--flag-fraction-threshold`).

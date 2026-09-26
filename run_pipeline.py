@@ -3,12 +3,13 @@
 import argparse
 import csv
 
-from dataset import load_truthfulqa
+from dataset import label_correctness, load_truthfulqa
 from grounding import (
     classify_confidence,
     classify_input_dependence,
     combine_input_dependence_and_confidence,
     content_word_groups,
+    final_hallucination_label,
     select_semantic_evidence_spans,
 )
 from jacobian import compute_counterfactual_logprobs, compute_token_confidence
@@ -32,6 +33,12 @@ def main():
                              "'confident' when separating parametric knowledge from "
                              "possible hallucination for low-dependence words. Should "
                              "be calibrated experimentally, same as --dependence-threshold.")
+    parser.add_argument("--overlap-threshold", type=float, default=0.3,
+                        help="lexical-overlap threshold for TruthfulQA's own noisy "
+                             "correctness heuristic (dataset.label_correctness), "
+                             "attached to every row as ground truth for benchmarking "
+                             "in evaluate.py. This is not human judgment -- see "
+                             "dataset.py's module docstring.")
     parser.add_argument("--device", type=str, default="cuda",
                         help='"cuda" for one GPU, "auto" to split across visible GPUs')
     parser.add_argument("--load-in-8bit", action="store_true", default=True,
@@ -43,6 +50,8 @@ def main():
         parser.error("--dependence-threshold must be nonnegative")
     if args.entropy_threshold < 0.0:
         parser.error("--entropy-threshold must be nonnegative")
+    if not 0.0 <= args.overlap_threshold <= 1.0:
+        parser.error("--overlap-threshold must be between 0 and 1")
 
     model, tokenizer = load_model(device=args.device, load_in_8bit=args.load_in_8bit)
     examples = load_truthfulqa(limit=args.n)
@@ -59,6 +68,9 @@ def main():
         )
         if generation.prompt.count(example.question) != 1:
             raise ValueError("Expected the question exactly once in the generation prompt")
+        ground_truth = label_correctness(
+            generation.generated_text, example, overlap_threshold=args.overlap_threshold
+        )
         evidence_spans = select_semantic_evidence_spans(
             model, tokenizer, generation.prompt, generation.prompt_ids,
             generation.generated_ids, example.question, word_groups,
@@ -127,8 +139,10 @@ def main():
             combined_classification = combine_input_dependence_and_confidence(
                 classification, confidence_classification
             )
+            hallucination_label = final_hallucination_label(combined_classification)
 
             token_rows.append({
+                "example_index": example_index,
                 "question": example.question,
                 "generated_text": generation.generated_text,
                 "token_index_in_answer": token_index,
@@ -147,13 +161,18 @@ def main():
                 "entropy_threshold": args.entropy_threshold,
                 "confidence_classification": confidence_classification,
                 "combined_classification": combined_classification,
+                "hallucination_label": hallucination_label,
+                "is_correct_heuristic": ground_truth["is_correct_heuristic"],
+                "max_correct_overlap": ground_truth["max_correct_overlap"],
+                "max_incorrect_overlap": ground_truth["max_incorrect_overlap"],
+                "overlap_threshold": args.overlap_threshold,
             })
 
             print(f"[{example_index}/{len(examples)}] {group['token']!r}: "
                   f"evidence={evidence_text!r} delta_logprob={delta_logprob} "
                   f"classification={classification} "
                   f"confidence={confidence_classification} (entropy={word_entropy:.3f}) "
-                  f"combined={combined_classification}", flush=True)
+                  f"combined={combined_classification} label={hallucination_label}", flush=True)
 
     def write_csv(path):
         if not token_rows:

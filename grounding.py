@@ -204,3 +204,24 @@ def combine_input_dependence_and_confidence(dependence_classification: str,
     if confidence_classification == "confident":
         return "parametric_knowledge"
     return "possible_hallucination"
+
+
+def final_hallucination_label(combined_classification: str) -> str:
+    """Collapse the three-way combined label into the binary call the task
+    actually asks for. Everything that isn't flagged as a possible
+    hallucination -- input-dependent words and words read as confident,
+    prompt-independent parametric knowledge -- is reported as not a
+    hallucination.
+
+    This inherits every limitation of `combined_classification` verbatim:
+    a word the model states confidently and consistently, but which is
+    still wrong (a contested or fabricated fact stated with low entropy),
+    will be labeled `not_hallucination` here. Confidence regardless of the
+    prompt is evidence of parametric knowledge, not proof it's correct --
+    telling those apart would need something like resampling the same
+    question and checking whether the word is stable, which this label
+    does not do.
+    """
+    if combined_classification == "possible_hallucination":
+        return "hallucination"
+    return "not_hallucination"
