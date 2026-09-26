@@ -46,13 +46,42 @@ def load_training_rows(path: str):
     with open(path, newline="", encoding="utf-8") as input_file:
         rows = list(csv.DictReader(input_file))
     required = {"example_index", "HARP_features", "counterfactual_score",
-                "semantic_similarity", "label"}
+                "semantic_similarity"}
     if not rows:
         raise ValueError(f"No training rows found in {path}")
     missing = required - set(rows[0])
     if missing:
         raise ValueError(f"Dataset is missing required columns: {sorted(missing)}")
     return rows
+
+
+def load_human_labels(path: str):
+    labels = {}
+    with open(path, newline="", encoding="utf-8") as input_file:
+        reader = csv.DictReader(input_file)
+        required = {"example_index", "question", "generated_text", "human_label"}
+        missing = required - set(reader.fieldnames or ())
+        if missing:
+            raise ValueError(f"Human-label file is missing columns: {sorted(missing)}")
+        for row in reader:
+            example_id = str(row["example_index"])
+            if example_id in labels:
+                raise ValueError(f"Duplicate human label for example {example_id!r}")
+            raw_label = row["human_label"].strip().casefold()
+            if raw_label not in {"supported", "hallucinated", "uncertain", ""}:
+                raise ValueError(
+                    f"Invalid human_label {row['human_label']!r} for example "
+                    f"{example_id!r}; use supported, hallucinated, or uncertain"
+                )
+            labels[example_id] = {
+                "question": row["question"],
+                "generated_text": row["generated_text"],
+                "label": {
+                    "supported": 0,
+                    "hallucinated": 1,
+                }.get(raw_label),
+            }
+    return labels
 
 
 def answer_groups(group_ids, labels):
@@ -132,10 +161,45 @@ def token_probabilities(detector: dict, X: np.ndarray) -> np.ndarray:
     return 1.0 / (1.0 + np.exp(-logits))
 
 
-def train_detector(data_path: str, basis_path: str, model_path: str,
+def train_detector(data_path: str, labels_path: str, basis_path: str, model_path: str,
                    test_size: float = 0.2, random_state: int = 42,
                    regularization: float = 1.0, max_iter: int = 300):
     rows = load_training_rows(data_path)
+    human_labels = load_human_labels(labels_path)
+    feature_answers = {}
+    for row in rows:
+        example_id = str(row["example_index"])
+        answer = (row.get("question", ""), row.get("generated_text", ""))
+        if example_id in feature_answers and feature_answers[example_id] != answer:
+            raise ValueError(f"Feature rows disagree on answer {example_id!r}")
+        feature_answers[example_id] = answer
+    unknown_labels = set(human_labels) - set(feature_answers)
+    if unknown_labels:
+        raise ValueError(
+            "Human-label file contains example IDs absent from feature data: "
+            f"{sorted(unknown_labels)[:5]}"
+        )
+    for example_id, human_row in human_labels.items():
+        if (human_row["question"], human_row["generated_text"]) != feature_answers[example_id]:
+            raise ValueError(
+                f"Question/answer text mismatch for human-labeled example {example_id!r}"
+            )
+
+    groups_all, _ = answer_groups(
+        [row["example_index"] for row in rows],
+        [0] * len(rows),
+    )
+    selected_groups = []
+    selected_labels = []
+    for row_group, example_id in zip(groups_all, feature_answers):
+        label = human_labels.get(str(example_id), {}).get("label")
+        if label is None:
+            continue
+        selected_groups.append(row_group)
+        selected_labels.append(label)
+    if not selected_groups:
+        raise ValueError("No supported/hallucinated human labels match the feature data")
+
     with open(basis_path, "rb") as basis_file:
         basis_record = torch.load(basis_file, map_location="cpu", weights_only=True)
     if basis_record["model_name"] != MODEL_NAME:
@@ -143,21 +207,23 @@ def train_detector(data_path: str, basis_path: str, model_path: str,
             f"Dataset basis is for {basis_record['model_name']!r}, expected {MODEL_NAME!r}"
         )
     reasoning_basis = basis_record["basis"].numpy()
-    X = np.vstack([
+    all_X = np.vstack([
         feature_vector(row, expected_harp_size=reasoning_basis.shape[1])
         for row in rows
     ])
-    try:
-        y = np.asarray([int(row["label"]) for row in rows], dtype=np.int64)
-    except ValueError as error:
-        raise ValueError("Labels must be integers 0 (supported) or 1 (hallucinated)") from error
-    if not np.isin(y, [0, 1]).all():
-        raise ValueError("Labels must be encoded as 0 or 1")
-    groups, answer_labels = answer_groups(
-        [row["example_index"] for row in rows], y
-    )
+    selected_row_indices = np.concatenate(selected_groups)
+    X = all_X[selected_row_indices]
+    rebased_groups = []
+    row_offset = 0
+    for group in selected_groups:
+        rebased_groups.append(np.arange(row_offset, row_offset + len(group)))
+        row_offset += len(group)
+    answer_labels = np.asarray(selected_labels, dtype=np.int64)
+    groups = rebased_groups
     if len(np.unique(answer_labels)) != 2:
-        raise ValueError("Training requires both binary answer-label classes")
+        raise ValueError(
+            "Human training labels must include both 'supported' and 'hallucinated' answers"
+        )
     if min(np.bincount(answer_labels, minlength=2)) < 2:
         raise ValueError("At least two distinct answers per label class are needed for validation")
 
@@ -218,14 +284,19 @@ def train_detector(data_path: str, basis_path: str, model_path: str,
         "decision_threshold": 0.5,
         "training_objective": "answer_level_max_pool_binary_cross_entropy",
         "training_answers": len(groups),
+        "label_source": "human_answer_level",
     }
     joblib.dump(detector, model_path)
+    print(f"Human-labeled answers used: {len(groups)}")
+    print(f"Unlabeled/uncertain answers excluded: {len(feature_answers) - len(groups)}")
     print(f"Saved max-pooled token detector to {model_path}")
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", type=str, default="results_tokens.csv")
+    parser.add_argument("--labels", required=True,
+                        help="human_labels.csv completed with answer-level labels")
     parser.add_argument("--harp-basis", type=str, default="harp_basis.pt")
     parser.add_argument("--out", type=str, default="token_detector.joblib")
     parser.add_argument("--test-size", type=float, default=0.2)
@@ -241,7 +312,7 @@ def main():
     if args.max_iter < 1:
         parser.error("--max-iter must be positive")
     train_detector(
-        args.data, args.harp_basis, args.out, args.test_size,
+        args.data, args.labels, args.harp_basis, args.out, args.test_size,
         args.random_state, args.regularization, args.max_iter,
     )
 

@@ -32,18 +32,21 @@ Likewise, `counterfactual_score` measures input dependence; neither it nor
 semantic similarity by itself determines whether a token is hallucinated.
 The classifier learns from all of these features together with HARP features.
 
-TruthfulQA does not supply token-level hallucination annotations. Consequently
-`label` is a weak answer-level proxy: the existing lexical-overlap correctness
-heuristic is copied to every content word in that answer
-(`1 = answer heuristic says incorrect`, `0 = says correct`). This limitation
-is recorded in `label_source`. The trainer does not treat that repeated label
-as a token annotation: it learns linear token logits using binary cross-entropy
-on the maximum token logit per answer, matching HARP's answer-level
-max-pooling formulation. This encourages at least one high-scoring content
-token in a weakly labeled hallucinated answer and low scores across a labeled
-supported answer. Individual token probabilities remain weakly supervised and
-must not be presented as token-ground-truth performance until trained and
-evaluated with genuine token annotations.
+The generated feature CSV includes the old lexical-overlap label for
+inspection, but **the trainer never uses it**. Instead, human answer-level
+labels are provided separately. Annotators see the question and complete
+answer, then label the response `supported` if its material factual claims are
+correct, `hallucinated` if at least one material factual claim is false or
+misleading, or `uncertain` if it cannot be judged. Lack of support in the
+question alone is not proof that a claim is false; use the available factual
+context or references when judging truth. Leave uncertain examples out of
+training.
+
+The trainer uses the answer labels with binary cross-entropy on the maximum
+content-token logit per answer, matching HARP's answer-level max-pooling
+formulation. Validation metrics are answer-level and human-label-based.
+Per-token probabilities are a localization signal learned under answer-level
+supervision, not human token annotations.
 
 ## Setup and dataset generation
 
@@ -65,16 +68,25 @@ disable it. Use `--content-tagger` to select a different installed spaCy model.
 
 ## Train and infer
 
-Train a max-pooled linear Logistic Regression head from the generated rows.
-Validation splits are stratified and grouped by answer/example to prevent
-token rows from the same answer leaking across the held-out split. Reported
-accuracy, F1, and ROC-AUC are answer-level metrics, consistent with the weak
-answer-level labels; the final saved estimator is then fit on all rows.
+Export one annotation row per response:
 
 ```sh
-python train_detector.py --data results_tokens.csv \
+python prepare_annotations.py --data results_tokens.csv --out human_labels.csv
+```
+
+Open `human_labels.csv`, review each question and complete response, and fill
+`human_label` with `supported`, `hallucinated`, or `uncertain`. Save that
+completed file, then train. Blank and uncertain labels are excluded; both
+supported and hallucinated labels are required.
+
+```sh
+python train_detector.py --data results_tokens.csv --labels human_labels.csv \
   --harp-basis harp_basis.pt --out token_detector.joblib
 ```
+
+Validation splits are stratified by answer and use only human labels. Reported
+accuracy, F1, and ROC-AUC are answer-level metrics; the final saved estimator
+is then fit on all human-labeled answers.
 
 Generate a full sentence and receive per-content-token hallucination
 probabilities. The response text remains intact; only its individual content

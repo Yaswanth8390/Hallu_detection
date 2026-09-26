@@ -39,6 +39,11 @@ def main():
             "Detector was not trained with the answer-level max-pooling objective; "
             "retrain it with the current train_detector.py before inference."
         )
+    if detector.get("label_source") != "human_answer_level":
+        raise ValueError(
+            "Detector was not trained from human answer labels; retrain with a "
+            "completed human-label file before inference."
+        )
     reasoning_basis = torch.as_tensor(detector["reasoning_basis"])
     if reasoning_basis.shape[1] != detector["harp_feature_size"]:
         raise ValueError("Detector HARP metadata does not match its saved projection basis")
