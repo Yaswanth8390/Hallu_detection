@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import List
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct"
 
@@ -23,15 +23,28 @@ class GenerationResult:
     full_ids: torch.Tensor            # (prompt_len + gen_len,)
 
 
-def load_model(dtype: torch.dtype = torch.bfloat16, device: str = "cuda"):
-    """Load Qwen2.5-7B-Instruct and its tokenizer."""
+def load_model(dtype: torch.dtype = torch.bfloat16, device: str = "cuda", load_in_8bit: bool = True):
+    """Load Qwen2.5-7B-Instruct and its tokenizer.
+
+    load_in_8bit=True (default) quantizes weights to ~7-8GB via bitsandbytes --
+    needed on a single 15GB T4, since bf16 weights alone (~14GB) leave almost
+    no headroom for the forward+backward passes the Jacobian/grounding code
+    needs. Set False if you have a bigger GPU (A100/L4/etc.) and want full
+    precision -- Jacobian magnitudes are somewhat sensitive to quantization,
+    so prefer False when you have the VRAM for it.
+    """
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    quant_config = BitsAndBytesConfig(load_in_8bit=True) if load_in_8bit else None
+    # 8-bit weights need accelerate to place them -- always use device_map="auto"
+    # in that case (it'll put everything on GPU 0 if that's all that's needed).
+    device_map = "auto" if (device == "auto" or load_in_8bit) else None
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
         torch_dtype=dtype,
-        device_map=device if device == "auto" else None,
+        device_map=device_map,
+        quantization_config=quant_config,
     )
-    if device != "auto":
+    if device_map is None:
         model.to(device)
     model.eval()
     return model, tokenizer
