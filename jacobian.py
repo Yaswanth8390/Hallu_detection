@@ -26,6 +26,12 @@ def _conditional_token_logprobs(model, prompt_ids: torch.Tensor,
         ).squeeze(1).cpu()
 
 
+def compute_token_logprobs(model, prompt_ids: torch.Tensor,
+                           generated_ids: torch.Tensor) -> torch.Tensor:
+    """Return conditional log-probabilities for a fixed generated sequence."""
+    return _conditional_token_logprobs(model, prompt_ids, generated_ids)
+
+
 def compute_counterfactual_logprobs(model, original_prompt_ids: torch.Tensor,
                                     counterfactual_prompt_ids: torch.Tensor,
                                     generated_ids: torch.Tensor,

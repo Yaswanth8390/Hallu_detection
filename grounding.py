@@ -2,6 +2,11 @@
 
 import re
 
+import torch
+import torch.nn.functional as F
+
+from model_utils import input_device
+
 
 _FUNCTION_WORDS = {
     "a", "an", "the", "and", "or", "but", "if", "then", "than", "as",
@@ -70,36 +75,93 @@ def content_word_groups(tokenizer, generated_ids, generated_text: str,
     return groups
 
 
-def _word_stem(word: str) -> str:
-    word = word.casefold()
-    for suffix in ("ing", "ed", "es", "s"):
-        if len(word) > len(suffix) + 3 and word.endswith(suffix):
-            return word[:-len(suffix)]
-    return word
+def select_semantic_evidence_spans(model, tokenizer, prompt_text: str,
+                                   prompt_ids: torch.Tensor,
+                                   generated_ids: torch.Tensor,
+                                   question: str, word_groups: list[dict],
+                                   max_span_words: int = 5) -> list[dict | None]:
+    """Select the most similar contiguous question span for each generated word.
 
-
-def find_evidence_span(question: str, generated_word: str) -> dict | None:
-    """Find a directly matching question span for a generated content word.
-
-    Matching is case-insensitive with a conservative English suffix fallback.
-    This is lexical evidence-span selection, not semantic entailment; callers
-    should leave the token unscored when no matching question span is found.
+    Both the generated word and candidate spans are mean-pooled final-layer
+    contextual hidden states from the same causal forward pass. Candidate
+    spans are contiguous n-grams of question words, capped at max_span_words.
+    This selects representational similarity; it does not establish entailment.
     """
-    question_words = list(_WORD_PATTERN.finditer(question))
-    target = generated_word.casefold()
-    matches = [match for match in question_words if match.group().casefold() == target]
-    if not matches:
-        target_stem = _word_stem(target)
-        matches = [match for match in question_words
-                   if _word_stem(match.group()) == target_stem]
-    if not matches:
-        return None
-    match = matches[0]
-    return {
-        "text": match.group(),
-        "start": match.start(),
-        "end": match.end(),
-    }
+    question_start = prompt_text.find(question)
+    if question_start < 0 or prompt_text.find(question, question_start + 1) >= 0:
+        raise ValueError("Question must occur exactly once in the formatted prompt")
+    if max_span_words < 1:
+        raise ValueError("max_span_words must be at least 1")
+
+    encoded_prompt = tokenizer(
+        prompt_text, return_offsets_mapping=True
+    )
+    encoded_ids = encoded_prompt["input_ids"]
+    offsets = encoded_prompt["offset_mapping"]
+    if encoded_ids and isinstance(encoded_ids[0], list):
+        encoded_ids = encoded_ids[0]
+        offsets = offsets[0]
+    expected_ids = [int(token_id) for token_id in prompt_ids.tolist()]
+    if [int(token_id) for token_id in encoded_ids] != expected_ids:
+        raise ValueError("Prompt tokenization with offsets does not match generation prompt IDs")
+
+    lexical_words = list(_WORD_PATTERN.finditer(question))
+    candidates = []
+    for start_word in range(len(lexical_words)):
+        for end_word in range(start_word + 1,
+                              min(len(lexical_words), start_word + max_span_words) + 1):
+            local_start = lexical_words[start_word].start()
+            local_end = lexical_words[end_word - 1].end()
+            char_start = question_start + local_start
+            char_end = question_start + local_end
+            prompt_positions = [
+                position for position, (offset_start, offset_end) in enumerate(offsets)
+                if offset_end > char_start and offset_start < char_end
+            ]
+            if prompt_positions:
+                candidates.append({
+                    "text": question[local_start:local_end],
+                    "start": char_start,
+                    "end": char_end,
+                    "prompt_positions": prompt_positions,
+                })
+    if not candidates:
+        return [None] * len(word_groups)
+
+    device = input_device(model)
+    full_ids = torch.cat((prompt_ids.reshape(-1), generated_ids.reshape(-1)))
+    with torch.no_grad():
+        base_model = (
+            model.get_base_model() if hasattr(model, "get_base_model")
+            else model.base_model
+        )
+        hidden = base_model(
+            input_ids=full_ids.to(device).unsqueeze(0),
+            use_cache=False,
+            return_dict=True,
+        ).last_hidden_state[0]
+
+    hidden = hidden.float()
+    candidate_vectors = [
+        hidden[torch.tensor(candidate["prompt_positions"], device=hidden.device)].mean(dim=0)
+        for candidate in candidates
+    ]
+    results = []
+    for group in word_groups:
+        generated_positions = [prompt_ids.numel() + index
+                               for index in group["token_indices"]]
+        target_vector = hidden[
+            torch.tensor(generated_positions, device=hidden.device)
+        ].mean(dim=0)
+        similarities = F.cosine_similarity(
+            torch.stack(candidate_vectors), target_vector.unsqueeze(0), dim=-1
+        )
+        best_index = int(similarities.argmax().item())
+        result = dict(candidates[best_index])
+        result.pop("prompt_positions")
+        result["similarity"] = similarities[best_index].item()
+        results.append(result)
+    return results
 
 
 def classify_input_dependence(delta_logprob: float, threshold: float) -> str:

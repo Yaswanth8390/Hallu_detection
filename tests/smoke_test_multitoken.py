@@ -2,6 +2,7 @@
 
 import csv
 import io
+from types import SimpleNamespace
 
 import torch
 from transformers import AutoModelForCausalLM, Qwen2Config
@@ -9,7 +10,7 @@ from transformers import AutoModelForCausalLM, Qwen2Config
 from grounding import (
     classify_input_dependence,
     content_word_groups,
-    find_evidence_span,
+    select_semantic_evidence_spans,
 )
 from jacobian import compute_counterfactual_logprobs
 
@@ -23,6 +24,37 @@ class OffsetTokenizer:
             "input_ids": [11, 21, 22, 23, 24],
             "offset_mapping": [(0, 3), (4, 12), (12, 24), (25, 27), (27, 28)],
         }
+
+
+class CharacterOffsetTokenizer:
+    all_special_ids = []
+
+    def __call__(self, text, return_offsets_mapping=False):
+        return {
+            "input_ids": [ord(character) for character in text],
+            "offset_mapping": [(index, index + 1) for index in range(len(text))],
+        }
+
+
+class CueRepresentationModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.embedding = torch.nn.Embedding(256, 2)
+        with torch.no_grad():
+            self.embedding.weight.zero_()
+            self.embedding.weight[:, 1] = 1.0
+            for character in "1984":
+                self.embedding.weight[ord(character)] = torch.tensor([1.0, 0.0])
+            self.embedding.weight[200] = torch.tensor([1.0, 0.0])
+
+    def get_input_embeddings(self):
+        return self.embedding
+
+    def get_base_model(self):
+        return self
+
+    def forward(self, input_ids, use_cache=False, return_dict=True):
+        return SimpleNamespace(last_hidden_state=self.embedding(input_ids))
 
 
 torch.manual_seed(0)
@@ -49,14 +81,35 @@ assert [group["token"] for group in groups] == ["Internationalization", "42"]
 assert groups[0]["token_indices"] == [1, 2]
 assert groups[0]["subtoken_count"] == 2
 assert groups[1]["token_indices"] == [3]
-first_evidence = find_evidence_span(sentence, groups[0]["token"])
-number_evidence = find_evidence_span(sentence, groups[1]["token"])
-assert first_evidence["text"] == "Internationalization"
-assert number_evidence["text"] == "42"
-assert find_evidence_span("Who wrote 1984?", "Orwell") is None
-assert find_evidence_span("How many seeds?", "seed")["text"] == "seeds"
-assert (sentence[:first_evidence["start"]] + sentence[first_evidence["end"]:]
-    == "The  42.")
+assert (sentence[:4] + sentence[4 + len("Internationalization"):]
+        == "The  42.")
+
+semantic_question = "Who wrote 1984?"
+semantic_prompt = f"Question: {semantic_question}"
+semantic_tokenizer = CharacterOffsetTokenizer()
+semantic_prompt_ids = torch.tensor(semantic_tokenizer(semantic_prompt)["input_ids"])
+semantic_match = select_semantic_evidence_spans(
+    CueRepresentationModel(),
+    semantic_tokenizer,
+    semantic_prompt,
+    semantic_prompt_ids,
+    torch.tensor([200]),
+    semantic_question,
+    [{"token": "Orwell", "token_indices": [0]}],
+)[0]
+assert semantic_match["text"] == "1984"
+assert semantic_match["similarity"] > 0.99
+tiny_model_match = select_semantic_evidence_spans(
+    model,
+    semantic_tokenizer,
+    semantic_prompt,
+    semantic_prompt_ids,
+    torch.tensor([201]),
+    semantic_question,
+    [{"token": "Orwell", "token_indices": [0]}],
+)[0]
+assert tiny_model_match["text"]
+assert -1.0 <= tiny_model_match["similarity"] <= 1.0
 
 logprobs = compute_counterfactual_logprobs(
     model, prompt_ids, counterfactual_prompt_ids, generated_ids

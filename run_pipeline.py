@@ -4,8 +4,8 @@ import argparse
 import csv
 
 from dataset import load_truthfulqa
-from grounding import classify_input_dependence, content_word_groups, find_evidence_span
-from jacobian import compute_counterfactual_logprobs
+from grounding import classify_input_dependence, content_word_groups, select_semantic_evidence_spans
+from jacobian import compute_counterfactual_logprobs, compute_token_logprobs
 from model_utils import generate_answer, load_model
 
 
@@ -46,14 +46,17 @@ def main():
         )
         if generation.prompt.count(example.question) != 1:
             raise ValueError("Expected the question exactly once in the generation prompt")
-        original_scores = compute_counterfactual_logprobs(
-            model, generation.prompt_ids, generation.prompt_ids,
-            generation.generated_ids,
-        )["original_token_logprobs"]
+        evidence_spans = select_semantic_evidence_spans(
+            model, tokenizer, generation.prompt, generation.prompt_ids,
+            generation.generated_ids, example.question, word_groups,
+        )
+        original_scores = compute_token_logprobs(
+            model, generation.prompt_ids, generation.generated_ids
+        )
         counterfactual_cache = {}
 
         for token_index, group in enumerate(word_groups):
-            evidence = find_evidence_span(example.question, group["token"])
+            evidence = evidence_spans[token_index]
             token_indices = group["token_indices"]
             original_logprob = sum(original_scores[index].item() for index in token_indices)
             counterfactual_logprob = ""
@@ -98,6 +101,7 @@ def main():
                 "token": group["token"],
                 "subtoken_count": group["subtoken_count"],
                 "evidence_span": evidence_text,
+                "evidence_similarity": evidence["similarity"] if evidence is not None else "",
                 "counterfactual_change": counterfactual_change,
                 "original_logprob": original_logprob,
                 "counterfactual_logprob": counterfactual_logprob,
