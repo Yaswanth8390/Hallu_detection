@@ -1,50 +1,145 @@
-# Token-Level Counterfactual Input Dependence
+# Merged Hallucination Detection + Mitigation Pipeline
 
-The pipeline measures how much each generated content word depends on the provided user question. It does not determine factual correctness or hallucination.
+This merges two previously separate systems into one pipeline:
 
-## Scoring
+1. **`probe/`** — a residual-stream probe (Qwen2.5 layer 20 hidden states ->
+   `StandardScaler` + `LogisticRegression`) that looks at a generated answer
+   and outputs `prob_hallucinated` in `[0, 1]`.
+2. **`blackboard/`** — the Blackboard-architecture mitigation system
+   (`BlackBoard-arch`). If a response's risk score is at/above a threshold
+   (default `0.70`), a sequence of agents — `ClaimExtractor` ->
+   `MemoryAgent` -> `RetrievalAgent` -> `VerifierAgent` -> `CorrectionAgent`
+   — extracts the riskiest claim, checks episodic memory, retrieves
+   evidence from a knowledge base, verifies the claim, and corrects or
+   hedges the response if it's unsupported.
 
-The current TruthfulQA input provides a question, but no supporting passage or evidence-span annotations. For each generated content word, the pipeline obtains final-layer contextual representations for the generated subtokens and candidate contiguous question spans. It mean-pools each word/span representation and selects the span with maximum cosine similarity, searching spans up to five question words. The selected span alone is removed for that word's counterfactual. This can associate a paraphrased cue such as `1984` with a representation for `Orwell`, but similarity is only a span proposal: it does not verify that the question entails or factually supports the generated claim. If no candidate span can be aligned to prompt tokens, the row is retained as `no_matching_evidence_span` without a counterfactual score.
+Nothing inside `probe/` or `blackboard/` was changed — the two systems
+already spoke the same language (a `[0, 1]` risk score in, a response out),
+so `pipeline.py` is just the wiring between them.
 
-The exact generated token IDs are held fixed in both conditions. For each subtoken, the model computes its conditional log-probability given the corresponding prompt and the same generated prefix before that subtoken. The original and counterfactual conditional log-probabilities are summed across the subtokens of each content word:
+## How a request flows end-to-end
 
-```text
-delta_logprob = original_logprob - counterfactual_logprob
+```
+question
+   │
+   ▼
+QwenResidualFeatureExtractor.batch_generate_and_extract_features()   [probe/llama_features.py]
+   │  -> generated answer + mean-pooled layer-20 residual-stream vector
+   ▼
+scaler.transform() -> classifier.predict_proba()                     [trained probe .joblib]
+   │  -> prob_hallucinated  (0.0–1.0)
+   ▼
+blackboard_core.process_response(prompt, response, prob_hallucinated) [blackboard/blackboard_core.py]
+   │
+   ├─ prob_hallucinated < 0.70  ─────────────────────────► response returned unchanged
+   │
+   └─ prob_hallucinated ≥ 0.70
+        ├─ ClaimExtractor   – picks the single riskiest claim
+        ├─ MemoryAgent      – checks episodic memory for a past verdict
+        ├─ RetrievalAgent   – (if no memory hit) pulls top-k evidence docs
+        ├─ VerifierAgent    – SUPPORTED / CONTRADICTED / INSUFFICIENT
+        └─ CorrectionAgent  – rewrites (if contradicted) or hedges (if
+                              insufficient); passes through unchanged if
+                              supported
+   │
+   ▼
+final_response  (+ full trace: extracted claim, verdict, evidence, etc.)
 ```
 
-A positive delta means the matched question span increased support for that word relative to the span-removed prompt. A near-zero delta means weak dependence on that span. A negative delta means the word was more likely without that span. None of these labels establishes correctness, and low dependence on its own does not distinguish two very different situations: the model already knew the fact (parametric knowledge), or the model was confabulating regardless of what was asked.
+## Project structure
 
-To separate those, each word also gets an entropy and a top1-vs-top2 log-probability margin (both in nats) from the model's *original*-prompt distribution at that position, from the same forward pass used for `original_logprob`. Low entropy / high margin means the model would likely produce this word regardless of the prompt. This is layered on top of the dependence label, not used alone: words already showing `strong_input_dependence` are left as-is (`combined_classification=input_dependent`), since the dependence signal already explains the question's role there. For the remaining words, low original-prompt entropy against `--entropy-threshold` yields `parametric_knowledge`; high entropy yields `possible_hallucination`. This still is not a correctness label — it only distinguishes "confident regardless of prompt" from "not confident and not prompt-dependent either," and the entropy threshold needs the same experimental calibration as `--dependence-threshold`.
-
-Words are grouped from tokenizer offsets so multi-subtoken words receive one row. Punctuation and a conservative list of grammatical/function words are skipped. Each row retains `generated_text` so the original generated response can be reconstructed, and includes the token, selected evidence span and its similarity, both log-probabilities, delta, dependence classification and threshold, word entropy and margin, entropy threshold, confidence classification, the combined classification, and a final binary `hallucination_label` (`hallucination` iff `combined_classification` is `possible_hallucination`, otherwise `not_hallucination`).
-
-`hallucination_label` inherits every limitation above: a word the model states confidently and consistently but which is still wrong -- a contested or fabricated fact given with low entropy -- reads as `not_hallucination` here, because low entropy is read as parametric knowledge regardless of whether that knowledge is correct. Telling those apart would need something like resampling the same question and checking whether the word is stable across samples, which this label does not do.
-
-## Run
-
-Install the packages in `requirements.txt`, then run on a GPU:
-
-```sh
-python run_pipeline.py --n 10 --max-new-tokens 32 --dependence-threshold 0.1 --entropy-threshold 1.0 --out results_tokens.csv --per-token-out results_tokens.csv
+```
+.
+├── pipeline.py            # NEW — the merge point (see below)
+├── unified_server.py       # NEW — one FastAPI service exposing /ask, /score_and_mitigate, /analyze
+├── probe/
+│   ├── llama_features.py   # Qwen2.5 residual-stream feature extractor
+│   ├── Dataset_builder.py  # manual-labeling dataset builder (HaluEval)
+│   ├── train_probe.py      # trains scaler + LogisticRegression -> probe.joblib
+│   └── infer_probe.py      # standalone probe inference (unchanged, still works on its own)
+├── blackboard/
+│   ├── blackboard_core.py  # Agents, Orchestrator, Blackboard, ChromaDB, process_response()
+│   ├── server.py           # original standalone Blackboard-only FastAPI app (unchanged)
+│   └── static/index.html   # live Blackboard trace demo UI
+└── requirements.txt
 ```
 
-`--grounding-threshold` remains as a compatibility alias for `--dependence-threshold`. The default dependence threshold is `0.1` log-probability units and should be calibrated experimentally; low dependence is reported as `weak_input_dependence`, never as hallucination. `--entropy-threshold` (default `1.0` nats) similarly needs calibration per model/vocabulary before its `parametric_knowledge` / `possible_hallucination` split should be trusted.
+## Setup
 
-The smoke tests use tiny random-initialized Qwen models and an offset-tokenizer fixture, so they validate log-probability extraction, subword aggregation, labels, and CSV formatting without downloading model weights or TruthfulQA:
-
-```sh
-python tests/smoke_test.py
-python tests/smoke_test_multitoken.py
+```bash
+pip install -r requirements.txt
 ```
 
-## Benchmark
+Environment variables:
 
-Every row also carries `example_index` and a ground-truth `is_correct_heuristic` from TruthfulQA's own lexical-overlap heuristic (`dataset.label_correctness`, `--overlap-threshold`, default `0.3`) -- this is a rough heuristic, not human judgment, see that function's docstring.
+| Variable | Required | Default | Purpose |
+|---|---|---|---|
+| `GROQ_API_KEY` | Yes | — | Powers the Verifier, Correction, and Claim Extraction agents. |
+| `PROBE_PATH` | Yes (for `/ask`) | — | Path to a trained probe `.joblib` from `probe/train_probe.py`. |
+| `PROBE_LAYER` | No | `20` | Must match the layer the probe was trained on. |
+| `QWEN_MODEL_ID` | No | `Qwen/Qwen2.5-7B-Instruct` | Model the feature extractor loads. |
+| `CHROMA_PERSIST_DIRECTORY` | No | `./halluciguard_chroma` | Blackboard's ChromaDB store (knowledge + memory). |
+| `GROQ_MODEL` | No | `openai/gpt-oss-120b` | Groq model for the Blackboard agents. |
 
-`evaluate.py` rolls the per-word `hallucination_label`s up to one prediction per TruthfulQA question (the fraction of that answer's words flagged `hallucination`, thresholded by `--flag-fraction-threshold`, default `0.0` = "any flagged word counts") and reports accuracy/precision/recall/F1/ROC-AUC/confusion-matrix against that ground truth, plus a handful of concrete disagreements to read by hand:
+A CUDA GPU is required for the probe half (`QwenResidualFeatureExtractor`
+refuses to fall back to CPU by design).
 
-```sh
-python evaluate.py --in results_tokens.csv
+## 1. Train the probe (one-time, if you don't already have `probe.joblib`)
+
+```bash
+cd probe
+python Dataset_builder.py --local_path HaluEval-main/data --max_questions 100 \
+    --output_path halueval_manual_features.pt
+python train_probe.py --data halueval_manual_features.pt --output probe.joblib
 ```
 
-This needs a CSV from the current `run_pipeline.py` -- it refuses an older results CSV missing `example_index` / `hallucination_label` / `is_correct_heuristic` rather than silently computing nonsense. Treat any single number here as provisional: it is downstream of four independently-uncalibrated thresholds (`--dependence-threshold`, `--entropy-threshold`, `--overlap-threshold`, `--flag-fraction-threshold`).
+## 2. Run the merged pipeline
+
+### Command line
+
+```bash
+export GROQ_API_KEY=your_key_here
+python pipeline.py --probe probe/probe.joblib \
+    --questions "What year was the Eiffel Tower completed?" "Who wrote Hamlet?"
+```
+
+Each question is generated, scored, and — if flagged — run through the
+Blackboard. Output shows the risk score, verdict, and final response.
+
+### As a service
+
+```bash
+export GROQ_API_KEY=your_key_here
+export PROBE_PATH=probe/probe.joblib
+uvicorn unified_server:app --host 0.0.0.0 --port 8000
+```
+
+```bash
+curl -X POST http://localhost:8000/ask \
+    -H "Content-Type: application/json" \
+    -d '{"question": "What year was the Eiffel Tower completed?"}'
+```
+
+`GET /health` reports whether the probe is loaded, plus the Blackboard's
+knowledge/memory doc counts and active threshold.
+
+## 3. Already have an answer from elsewhere?
+
+Use `pipeline.py`'s `run_on_qa(question, answer)` (or the
+`/score_and_mitigate` endpoint) to score and mitigate a `(question, answer)`
+pair without generating a new answer — e.g. if a different model produced
+the response and you just want this pipeline to risk-score and ground it.
+
+## Notes
+
+- `probe/infer_probe.py` still works standalone (score a `.pt` file of
+  precomputed features, or run questions through the probe with no
+  Blackboard involved) — nothing there was changed.
+- `blackboard/server.py` still works standalone too (bring your own
+  `confidence_score`) — also unchanged. `unified_server.py`'s `/analyze`
+  route is the same call, just hosted alongside the new `/ask` route.
+- The risk threshold (`blackboard_core.HALLUCINATION_RISK_THRESHOLD`,
+  default `0.70`) is shared by both halves once merged: it's the same
+  number the probe's score is compared against. Override it per-run with
+  `pipeline.py --threshold` or `HallucinationMitigationPipeline(...,
+  override_threshold=...)`.

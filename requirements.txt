@@ -1,5 +1,15 @@
-torch>=2.1
-transformers>=4.45
-datasets>=2.19
-accelerate>=0.30
-bitsandbytes>=0.43
+# Blackboard mitigation side
+fastapi
+uvicorn
+chromadb
+openai
+google-genai
+
+# Probe / detection side
+torch
+transformers
+scikit-learn
+joblib
+numpy
+datasets
+accelerate
