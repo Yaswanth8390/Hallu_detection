@@ -25,7 +25,7 @@ def main():
     parser.add_argument("--load-in-8bit", action="store_true", default=True,
                         help="quantize weights to 8-bit (default)")
     parser.add_argument("--full-precision", dest="load_in_8bit", action="store_false",
-                        help="load full bf16 weights")
+                        help="load unquantized FP16 weights")
     args = parser.parse_args()
     if not 0.0 <= args.grounding_threshold <= 1.0:
         parser.error("--grounding-threshold must be between 0 and 1")
@@ -63,8 +63,8 @@ def main():
                 "grouped_target_logit": score["target_logit"],
             })
 
-        print(f"[{example_index}/{len(examples)}] {example.question!r} -> "
-              f"{generation.generated_text!r} ({len(word_groups)} content words scored)")
+            print(f"[{example_index}/{len(examples)}] {example.question!r} -> "
+                f"{generation.generated_text!r} ({len(word_groups)} content words scored)")
 
     def write_csv(path):
         if not token_rows:

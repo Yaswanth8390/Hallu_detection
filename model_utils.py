@@ -2,7 +2,7 @@
 Model loading + generation utilities for the Jacobian hallucination-detection pipeline.
 
 Target model: Qwen/Qwen2.5-7B-Instruct
-Requires a GPU with ~16-20GB VRAM for fp16/bf16 inference (or load in 8-bit/4-bit on smaller GPUs).
+Uses FP16 by default, which is supported by T4 GPUs; load in 8-bit on smaller GPUs.
 """
 
 from dataclasses import dataclass
@@ -23,10 +23,10 @@ class GenerationResult:
     full_ids: torch.Tensor            # (prompt_len + gen_len,)
 
 
-def load_model(dtype: torch.dtype = torch.bfloat16, device: str = "cuda", load_in_8bit: bool = True):
+def load_model(dtype: torch.dtype = torch.float16, device: str = "cuda", load_in_8bit: bool = True):
     """Load Qwen2.5-7B-Instruct and its tokenizer.
 
-    device="auto" with load_in_8bit=False splits full bf16 weights across
+    device="auto" with load_in_8bit=False splits full FP16 weights across
     all visible GPUs via accelerate (e.g. two 15GB T4s = ~30GB pooled) --
     use this if you have >1 GPU and want full precision without the
     quantization tradeoff. load_in_8bit=True (default) instead quantizes
@@ -50,7 +50,7 @@ def load_model(dtype: torch.dtype = torch.bfloat16, device: str = "cuda", load_i
     model.eval()
 
     # We only ever need gradients w.r.t. hidden states (via retain_grad in
-    # jacobian.py/grounding.py), never w.r.t. the model's own weights. Without
+    # jacobian.py), never w.r.t. the model's own weights. Without
     # this, every backward() call also allocates and stores a full gradient
     # buffer for all 7B parameters (~same size as the weights themselves),
     # which is very likely what's causing backward-pass OOMs even after
