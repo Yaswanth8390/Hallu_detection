@@ -48,3 +48,80 @@ python evaluate.py --in results_tokens.csv
 ```
 
 This needs a CSV from the current `run_pipeline.py` -- it refuses an older results CSV missing `example_index` / `hallucination_label` / `is_correct_heuristic` rather than silently computing nonsense. Treat any single number here as provisional: it is downstream of four independently-uncalibrated thresholds (`--dependence-threshold`, `--entropy-threshold`, `--overlap-threshold`, `--flag-fraction-threshold`).
+
+## Hidden-state hallucination probes
+
+The `build_dataset.py`, `train_probe.py`, and `train_rnn.py` scripts are a separate
+experiment from the token-level counterfactual pipeline above. They generate short
+answers for TriviaQA or NQ-Open, extract Llama hidden-state features, then train
+classifiers to predict whether each answer is incorrect. Their label convention is
+`0 = correct` and `1 = incorrect / hallucination`.
+
+### Build and manually label examples
+
+Use the `interp` environment (or install the packages in `requirements.txt` plus
+`scikit-learn` and `tqdm`) and a CUDA GPU with access to the selected Hugging Face
+model. The default model is gated and may require Hugging Face access approval.
+
+First run the builder with `--manual-labels`. It saves candidate questions and
+generated answers to a CSV, alongside the feature files. The first run still uses the
+automatic answer-alias matcher for labels:
+
+```sh
+python build_dataset.py \
+  --dataset triviaqa --n 6000 --seed 0 \
+  --out data/triviaqa --manual-labels data/triviaqa/manual_labels.csv
+```
+
+Review `data/triviaqa/manual_labels.csv` and fill the `label` column with `correct`
+or `incorrect` (also accepts `0` or `1`). Add optional comments in `notes`. Then
+rerun the same command with `--manual-only` to rebuild the feature set using only
+manually labeled examples:
+
+```sh
+python build_dataset.py \
+  --dataset triviaqa --n 6000 --seed 0 \
+  --out data/triviaqa --manual-labels data/triviaqa/manual_labels.csv --manual-only
+```
+
+The row index is tied to the shuffled dataset order, so keep the same dataset, `--n`,
+and `--seed` when reviewing and rebuilding. The builder checks that the question and
+generated answer still match the CSV row before using its label; stale labels are
+cleared rather than applied to a different answer. Unlabeled rows are omitted in
+`--manual-only` mode. Answers matching the builder's abstention patterns are omitted.
+Provide enough reviewed examples in both classes for the stratified train/validation/test
+splits used by the trainers.
+
+The builder writes:
+
+- `features.npz`: selected-layer features, labels, log-probability/entropy baselines,
+  and layer indices.
+- `traj.npy`: a trajectory at those same seven selected layers, with prompt-last,
+  answer-mean, and answer-last positions. The RNN uses these seven depth steps; it
+  does not currently consume every transformer layer.
+- `meta.jsonl`: question, generated answer, gold references, and label provenance.
+- `unembed_basis.pt`: leading output-projection directions used by the unembedding
+  probes.
+
+### Train and evaluate
+
+Train/evaluate the logistic and unembedding probes:
+
+```sh
+python train_probe.py --data data/triviaqa --k 64 --seeds 3 --out results_probe.json
+```
+
+Train/evaluate the recurrent trajectory model:
+
+```sh
+python train_rnn.py --data data/triviaqa --pos 1 --seeds 3 --out results_rnn.json
+```
+
+For either trainer, `--transfer data/nq_open` evaluates on a second dataset; build
+that dataset with the same model and compatible feature configuration first. Both
+scripts reserve validation data for model/cell selection and report final test
+metrics. AUROC/AUPRC are dataset-level predictive metrics, not proof that an
+individual answer is factually correct. The automatic matcher is weak supervision;
+prefer reviewed labels for conclusions about hallucination detection. Manual labels
+for these scripts are answer-level labels and are independent from the token-level
+heuristic benchmark described above.

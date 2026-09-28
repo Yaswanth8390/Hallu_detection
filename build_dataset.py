@@ -45,6 +45,7 @@ def is_correct(answer: str, golds: list[str]) -> bool:
 
 
 def ensure_manual_labels(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
     if not path.exists():
         with path.open("w", newline="") as f:
             writer = csv.writer(f)
@@ -62,7 +63,7 @@ def load_manual_labels(path: Path):
             if idx is None or idx == "":
                 continue
             try:
-                labels[int(idx)] = row.get("label", "").strip().lower()
+                labels[int(idx)] = row
             except ValueError:
                 continue
     return labels
@@ -102,6 +103,8 @@ def main():
     ap.add_argument("--manual-labels", default=None, help="CSV with columns: index, question, generated_answer, label, notes")
     ap.add_argument("--manual-only", action="store_true", help="Only keep rows with manual labels and skip auto labels for unlabeled rows")
     args = ap.parse_args()
+    if args.manual_only and not args.manual_labels:
+        ap.error("--manual-only requires --manual-labels")
 
     out = Path(args.out); out.mkdir(parents=True, exist_ok=True)
     manual_labels = load_manual_labels(Path(args.manual_labels)) if args.manual_labels else {}
@@ -117,6 +120,7 @@ def main():
 
     qa = load_qa(args.dataset, args.n, args.seed)
     feats, labels, base, meta, traj = [], [], [], [], []
+    generated_rows = {}
 
     for b in tqdm(range(0, len(qa), args.bs), desc="generate+extract"):
         batch = qa[b:b + args.bs]
@@ -142,11 +146,13 @@ def main():
             if not ans_ids:
                 continue
             text = tok.decode(ans_ids, skip_special_tokens=True).strip()
+            generated_rows[global_idx] = {"question": q, "generated_answer": text}
             if ABSTAIN.search(text):
                 continue
 
-            if args.manual_labels and global_idx in manual_labels:
-                label = manual_labels[global_idx]
+            manual_row = manual_labels.get(global_idx)
+            if manual_row and manual_row.get("question") == q and manual_row.get("generated_answer") == text:
+                label = manual_row.get("label", "").strip().lower()
                 if label in {"correct", "corr", "c", "0", "0.0"}:
                     y = 0
                 elif label in {"incorrect", "wrong", "hallucination", "hallucinated", "1", "1.0"}:
@@ -183,10 +189,31 @@ def main():
             base.append([tlp.mean().item(), tlp.min().item(), tlp[0].item(), ent.mean().item()])
 
             labels.append(y)
-            meta.append({"q": q, "answer": text, "gold": golds[:3], "y": y, "manual": global_idx in manual_labels})
+            meta.append({"q": q, "answer": text, "gold": golds[:3], "y": y,
+                         "manual": bool(manual_row and manual_row.get("question") == q
+                                        and manual_row.get("generated_answer") == text
+                                        and manual_row.get("label", "").strip())})
 
     if len(feats) == 0:
         raise ValueError("No labeled examples were retained. Check --manual-labels or the generated answers.")
+
+    if args.manual_labels:
+        rows = []
+        for idx, item in sorted(generated_rows.items()):
+            previous = manual_labels.get(idx, {})
+            same_example = (previous.get("question") == item["question"]
+                            and previous.get("generated_answer") == item["generated_answer"])
+            rows.append({
+                "index": idx,
+                "question": item["question"],
+                "generated_answer": item["generated_answer"],
+                "label": previous.get("label", "") if same_example else "",
+                "notes": previous.get("notes", "") if same_example else "",
+            })
+        with Path(args.manual_labels).open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=["index", "question", "generated_answer", "label", "notes"])
+            writer.writeheader()
+            writer.writerows(rows)
 
     traj_arr = np.stack(traj)
     np.save(out / "traj.npy", traj_arr)

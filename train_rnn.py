@@ -1,6 +1,6 @@
 """
 Stage 3: a recurrent model that reads the embedding trajectory across depth
-(layer 0 = token embedding -> layer 32 = final residual stream) and detects hallucination.
+(selected hidden-state indices 8, 12, 16, 20, 24, 28, and 32) and detects hallucination.
 
 It is not just a classifier on the last state:
   * A causal GRU walks layer by layer. At each layer it sees the state x_l AND the change
@@ -19,7 +19,8 @@ Ablations:  --beta 0  (no future prediction)   --no_delta  (states only, no chan
 
 Usage:
   python train_rnn.py --data data/triviaqa --transfer data/nq_open --pos 1 --seeds 3
-Needs data built with build_dataset.py --traj. Uses the same 70/10/20 split as train_probe.py.
+Needs data built with build_dataset.py. It reads the same seven selected layers and
+three feature positions as the probe scripts. Uses the same 70/10/20 split.
 """
 import argparse, json
 from pathlib import Path
@@ -40,10 +41,20 @@ def auc(y, s):
 
 
 def load(d, pos):
-    y = np.load(Path(d) / "features.npz")["y"]
+    if pos not in range(len(POS)):
+        raise ValueError(f"pos must be in 0..{len(POS) - 1}, got {pos}")
+    with np.load(Path(d) / "features.npz") as features:
+        y = features["y"].copy()
+        layers = features["layers"].copy()
     traj = np.load(Path(d) / "traj.npy", mmap_mode="r")
-    X = np.ascontiguousarray(traj[:len(y), :, pos, :])  # [N, T, d] fp16
-    return torch.from_numpy(X).to(DEV), y
+    if traj.ndim != 4 or traj.shape[2] != len(POS):
+        raise ValueError(f"expected traj.npy with shape [N, T, 3, d], got {traj.shape}")
+    if traj.shape[0] != len(y):
+        raise ValueError(f"label/trajectory count mismatch: {len(y)} labels vs {traj.shape[0]} trajectories")
+    if len(layers) != traj.shape[1]:
+        raise ValueError(f"layer metadata/trajectory mismatch: {len(layers)} layers vs {traj.shape[1]} steps")
+    X = np.ascontiguousarray(traj[:, :, pos, :])  # [N, selected layers, d]
+    return torch.from_numpy(X).to(DEV), y, layers
 
 
 def moments(X, fn, chunk=256):
@@ -86,7 +97,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", required=True)
     ap.add_argument("--transfer", default=None)
-    ap.add_argument("--pos", type=int, default=1, help="0 prompt_last, 1 ans_mean, 2 ans_last")
+    ap.add_argument("--pos", type=int, choices=range(3), default=1,
+                    help="0 prompt_last, 1 ans_mean, 2 ans_last")
     ap.add_argument("--m", type=int, default=256)
     ap.add_argument("--hid", type=int, default=256)
     ap.add_argument("--alpha", type=float, default=0.5, help="weight of per-layer BCE")
@@ -99,16 +111,29 @@ def main():
     ap.add_argument("--seeds", type=int, default=3)
     ap.add_argument("--out", default="results_rnn.json")
     args = ap.parse_args()
+    if args.seeds < 1 or args.epochs < 1 or args.patience < 1 or args.bs < 1:
+        ap.error("--seeds, --epochs, --patience, and --bs must be positive")
+    if args.alpha < 0 or args.beta < 0:
+        ap.error("--alpha and --beta must be non-negative")
 
-    X, y = load(args.data, args.pos)
+    X, y, layers = load(args.data, args.pos)
     N, T, d = X.shape
+    if not np.isin(y, [0, 1]).all() or len(np.unique(y)) != 2:
+        raise ValueError("training labels must contain both binary classes 0 and 1")
     idx = np.arange(N)
     tr, te = train_test_split(idx, test_size=0.2, stratify=y, random_state=0)
     tr, va = train_test_split(tr, test_size=0.125, stratify=y[tr], random_state=0)
     Xtr, Xva, Xte = X[tr], X[va], X[te]
     ytr, yva, yte = y[tr], y[va], y[te]
-    XT, yT = load(args.transfer, args.pos) if args.transfer else (None, None)
+    XT, yT, transfer_layers = load(args.transfer, args.pos) if args.transfer else (None, None, None)
+    if XT is not None and XT.shape[1:] != X.shape[1:]:
+        raise ValueError(f"transfer trajectory shape {tuple(XT.shape[1:])} does not match training {tuple(X.shape[1:])}")
+    if transfer_layers is not None and not np.array_equal(transfer_layers, layers):
+        raise ValueError("transfer layer indices do not match training layer indices")
+    if yT is not None and (not np.isin(yT, [0, 1]).all() or len(np.unique(yT)) != 2):
+        raise ValueError("transfer labels must contain both binary classes 0 and 1")
     print(f"n={N} T={T} d={d} pos={POS[args.pos]} halluc_rate={y.mean():.3f} | {len(tr)}/{len(va)}/{len(te)}")
+    transition_names = [f"{left}->{right}" for left, right in zip(layers[:-1], layers[1:])]
 
     # per-(layer, dim) normalization of states and of layer-to-layer changes, from train only
     mu, sd = moments(Xtr, lambda x: x)
@@ -175,12 +200,16 @@ def main():
 
     summ = {k: np.mean(v, 0).tolist() for k, v in R.items() if v}
     summ["test_auroc_std"] = float(np.std(R["test_auroc"]))
+    summ["depth_layers"] = layers.tolist()
+    summ["surprise_transitions"] = transition_names
     summ["args"] = vars(args)
     print(f"\ntest AUROC {np.mean(R['test_auroc']):.4f} +- {summ['test_auroc_std']:.4f}"
           f" | AUPRC {np.mean(R['test_auprc']):.4f}"
           + (f" | transfer AUROC {np.mean(R['transfer_auroc']):.4f}" if R["transfer_auroc"] else ""))
-    print("per-layer AUROC (layer 0..32):", " ".join(f"{a:.2f}" for a in summ["depth_auroc"]))
-    print("surprise gap halluc-correct (layer 1..32):", " ".join(f"{a:+.3f}" for a in summ["surprise_gap"]))
+    print(f"per-layer AUROC (layers {', '.join(map(str, layers.tolist()))}):",
+          " ".join(f"{a:.2f}" for a in summ["depth_auroc"]))
+    print(f"surprise gap halluc-correct (transitions {', '.join(transition_names)}):",
+          " ".join(f"{a:+.3f}" for a in summ["surprise_gap"]))
     Path(args.out).write_text(json.dumps(summ, indent=2))
 
 
