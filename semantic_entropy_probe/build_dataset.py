@@ -34,6 +34,7 @@ def sample_responses(model, tokenizer, prompt_ids: torch.Tensor,
         with torch.no_grad():
             output = model.generate(
                 input_ids,
+                attention_mask=torch.ones_like(input_ids),
                 max_new_tokens=max_new_tokens,
                 do_sample=True,
                 temperature=temperature,
