@@ -68,10 +68,10 @@ def load_human_labels(path: str):
             if example_id in labels:
                 raise ValueError(f"Duplicate human label for example {example_id!r}")
             raw_label = row["human_label"].strip().casefold()
-            if raw_label not in {"supported", "hallucinated", "uncertain", ""}:
+            if raw_label not in {"supported", "hallucinated", "abstain", "uncertain", ""}:
                 raise ValueError(
                     f"Invalid human_label {row['human_label']!r} for example "
-                    f"{example_id!r}; use supported, hallucinated, or uncertain"
+                    f"{example_id!r}; use supported, hallucinated, or abstain"
                 )
             labels[example_id] = {
                 "question": row["question"],

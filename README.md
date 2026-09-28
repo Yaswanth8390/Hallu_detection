@@ -68,19 +68,30 @@ disable it. Use `--content-tagger` to select a different installed spaCy model.
 
 ## Train and infer
 
-Export one annotation row per response:
+Launch the interactive review window from the repository folder:
+
+```sh
+streamlit run review_app.py
+```
+
+The app shows each question and complete response, the earlier automatic
+answer/token labels and evidence scores, and lets you mark the response
+`Supported`, `Hallucinated`, or `Abstain`. The answer-level CSV at
+`human_labels.csv` is automatically updated as you annotate; you can also
+download a copy from the app. If you prefer a spreadsheet, export the same
+blank template with:
 
 ```sh
 python prepare_annotations.py --data results_tokens.csv --out human_labels.csv
 ```
 
-Open `human_labels.csv`, review each question and complete response, and fill
-`human_label` with `supported`, `hallucinated`, or `uncertain`. Save that
-completed file, then train. Blank and uncertain labels are excluded; both
-supported and hallucinated labels are required.
+Fill `human_label` with `supported`, `hallucinated`, or `abstain`. Both blank
+and abstain labels are excluded from training. Both supported and hallucinated
+answers are required.
 
 ```sh
-python train_detector.py --data results_tokens.csv --labels human_labels.csv \
+python train_detector.py --data results_tokens.csv \
+  --labels human_labels.csv \
   --harp-basis harp_basis.pt --out token_detector.joblib
 ```
 
@@ -110,4 +121,5 @@ the target model:
 python tests/smoke_test.py
 python tests/smoke_test_multitoken.py
 python tests/smoke_test_training.py
+python tests/smoke_test_review_app.py
 ```
