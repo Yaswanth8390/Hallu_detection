@@ -21,10 +21,12 @@ pip install -r requirements.txt
 pip install scikit-learn tqdm
 ```
 
-Dataset creation uses CUDA and the default model,
-`meta-llama/Llama-3.1-8B-Instruct`. Access to this gated Hugging Face model may
-require approval and authentication. Pass `--model` to `build_dataset.py` to use a
-different compatible causal language model.
+Dataset creation uses CUDA and defaults to
+`Qwen/Qwen2.5-7B-Instruct`. The builder extracts hidden states at model indices
+`4, 8, 12, 16, 20, 24, 28`; index `28` is the final hidden state of Qwen2.5-7B.
+If you override `--model`, it must expose all of these hidden-state indices and
+compatible tokenizer/chat-template and output-projection interfaces. Use the same
+model and layer configuration for datasets used in transfer evaluation.
 
 ## Build a dataset and manually label it
 
@@ -66,8 +68,9 @@ The output directory contains:
 
 - `features.npz`: probe features, binary labels, generation baselines, and layer
   indices.
-- `traj.npy`: per-layer hidden-state trajectory at prompt-last, answer-mean, and
-  answer-last positions, used by the recurrent probe.
+- `traj.npy`: hidden-state trajectory across indices `4, 8, 12, 16, 20, 24, 28`,
+  each with prompt-last, answer-mean, and answer-last positions, used by the
+  recurrent probe.
 - `meta.jsonl`: question, generated answer, reference answers, and label provenance.
 - `unembed_basis.pt`: leading output-projection directions for unembedding probes.
 - The manually reviewed CSV when `--manual-labels` is provided.

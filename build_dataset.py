@@ -2,7 +2,7 @@
 Stage 1: build a labeled hallucination dataset AND extract features in one pass.
 
 For each question:
-  1. Llama-3.1-8B-Instruct greedily generates a short answer.
+  1. Qwen2.5-7B-Instruct greedily generates a short answer.
   2. Answer is labeled against gold aliases (y=1 -> hallucination / wrong, y=0 -> correct).
   3. One teacher-forced forward pass over prompt+answer stores hidden states at
      several layers and three positions:
@@ -27,7 +27,7 @@ from datasets import load_dataset
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-LAYERS = [8, 12, 16, 20, 24, 28, 32]  # hidden_states indices; 32 = final (post-norm)
+LAYERS = [4, 8, 12, 16, 20, 24, 28]  # Qwen2.5-7B indices; 28 = final hidden state
 SYSTEM = "Answer the question with a short factual answer (a few words). Do not explain."
 ABSTAIN = re.compile(r"(i don'?t know|not sure|cannot|can'?t (answer|determine)|unknown|no information)", re.I)
 
@@ -95,7 +95,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", default="triviaqa")
     ap.add_argument("--n", type=int, default=6000)
-    ap.add_argument("--model", default="meta-llama/Llama-3.1-8B-Instruct")
+    ap.add_argument("--model", default="Qwen/Qwen2.5-7B-Instruct")
     ap.add_argument("--out", required=True)
     ap.add_argument("--bs", type=int, default=16)
     ap.add_argument("--max_new", type=int, default=32)
@@ -115,7 +115,15 @@ def main():
     tok.pad_token = tok.eos_token
     tok.padding_side = "left"
     model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.bfloat16, device_map="cuda").eval()
-    stop_ids = {tok.eos_token_id, tok.convert_tokens_to_ids("<|eot_id|>")}
+    eos_ids = model.generation_config.eos_token_id
+    if eos_ids is None:
+        eos_ids = tok.eos_token_id
+    stop_ids = set(eos_ids if isinstance(eos_ids, list) else [eos_ids])
+    if tok.eos_token_id is not None:
+        stop_ids.add(tok.eos_token_id)
+    stop_ids.discard(None)
+    if not stop_ids:
+        raise ValueError("The tokenizer/model must define at least one EOS token ID")
     save_unembed_basis(model, out)
 
     qa = load_qa(args.dataset, args.n, args.seed)
@@ -169,6 +177,11 @@ def main():
             full = torch.cat([prompt_ids, torch.tensor(ans_ids, device="cuda")]).unsqueeze(0)
             with torch.no_grad():
                 o = model(full, output_hidden_states=True)
+                if len(o.hidden_states) <= max(LAYERS):
+                    raise ValueError(
+                        f"model {args.model!r} exposes hidden-state indices 0..{len(o.hidden_states) - 1}; "
+                        f"the configured probe layers require index {max(LAYERS)}"
+                    )
 
             per_layer = []
             traj_layers = []
