@@ -25,4 +25,3 @@ sep-infer = "semantic_entropy_probe.inference:main"
 
 [tool.setuptools]
 packages = ["semantic_entropy_probe"]
-py-modules = ["dataset", "jacobian", "model_utils"]

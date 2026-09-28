@@ -8,31 +8,21 @@ import random
 import numpy as np
 import torch
 
-from dataset import load_truthfulqa
-from model_utils import MODEL_NAME, input_device, load_model
 from .entropy import (
     NLIEntailment,
     extract_response_representation,
     semantic_entropy,
+)
+from .runtime import (
+    MODEL_NAME,
+    encode_question,
+    input_device,
+    load_model,
+    load_questions,
     sequence_log_probability,
 )
 
 DEFAULT_NLI_MODEL = "MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli"
-
-
-def prompt_for_question(tokenizer, question: str) -> tuple[str, torch.Tensor]:
-    messages = [
-        {
-            "role": "system",
-            "content": "Answer the question concisely and factually, in one short sentence.",
-        },
-        {"role": "user", "content": question},
-    ]
-    prompt = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
-    prompt_ids = tokenizer(prompt, return_tensors="pt").input_ids[0]
-    return prompt, prompt_ids
 
 
 def sample_responses(model, tokenizer, prompt_ids: torch.Tensor,
@@ -79,10 +69,10 @@ def build_dataset(args):
     )
     nli = NLIEntailment(args.nli_model, device=args.nli_device,
                         batch_size=args.nli_batch_size)
-    examples = load_truthfulqa(limit=args.n)
+    questions = load_questions(args.n, split=args.split)
     rows = []
-    for example_index, example in enumerate(examples, start=1):
-        _, prompt_ids = prompt_for_question(tokenizer, example.question)
+    for example_index, question in enumerate(questions, start=1):
+        prompt_ids = encode_question(tokenizer, question)
         samples = sample_responses(
             model, tokenizer, prompt_ids, args.num_samples,
             args.max_new_tokens, args.temperature, args.top_p,
@@ -100,7 +90,7 @@ def build_dataset(args):
         )
         rows.append({
             "example_index": example_index,
-            "question": example.question,
+            "question": question,
             "generated_text": representation_sample["text"],
             "hidden_features": json.dumps(hidden.tolist()),
             "semantic_entropy": entropy,
@@ -113,7 +103,7 @@ def build_dataset(args):
             "hidden_layer": args.layer,
         })
         print(
-            f"[{example_index}/{len(examples)}] H_SE={entropy:.4f} nats "
+            f"[{example_index}/{len(questions)}] H_SE={entropy:.4f} nats "
             f"clusters={cluster_count}/{len(samples)}",
             flush=True,
         )
@@ -130,6 +120,7 @@ def build_dataset(args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--n", type=int, default=100)
+    parser.add_argument("--split", default="validation")
     parser.add_argument("--num-samples", type=int, default=10)
     parser.add_argument("--max-new-tokens", type=int, default=48)
     parser.add_argument("--temperature", type=float, default=1.0)

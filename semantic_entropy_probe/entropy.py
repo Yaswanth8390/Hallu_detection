@@ -127,17 +127,6 @@ class NLIEntailment:
         return matrix
 
 
-def sequence_log_probability(model, prompt_ids: torch.Tensor,
-                             generated_ids: torch.Tensor) -> float:
-    """Score a sampled sequence under the model's untempered token distribution."""
-    if generated_ids.numel() == 0:
-        raise ValueError("Cannot score an empty generated answer")
-    from jacobian import compute_token_logprobs
-
-    token_logprobs = compute_token_logprobs(model, prompt_ids, generated_ids)
-    return float(token_logprobs.sum().item())
-
-
 def extract_response_representation(model, prompt_ids: torch.Tensor,
                                     generated_ids: torch.Tensor,
                                     layer: int = -1) -> np.ndarray:

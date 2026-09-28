@@ -11,7 +11,7 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
-from model_utils import MODEL_NAME
+from .runtime import MODEL_NAME
 
 
 def read_sep_dataset(path: str) -> tuple[np.ndarray, np.ndarray, int]:

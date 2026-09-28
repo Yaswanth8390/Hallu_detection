@@ -5,8 +5,8 @@ import json
 
 import joblib
 
-from model_utils import MODEL_NAME, generate_answer, load_model
 from .entropy import extract_response_representation
+from .runtime import MODEL_NAME, generate_answer, load_model
 
 
 def main():
@@ -35,8 +35,7 @@ def main():
         device=args.device, load_in_8bit=args.load_in_8bit
     )
     generation = generate_answer(
-        model, tokenizer, args.question, device=args.device,
-        max_new_tokens=args.max_new_tokens,
+        model, tokenizer, args.question, max_new_tokens=args.max_new_tokens,
     )
     representation = extract_response_representation(
         model, generation.prompt_ids, generation.generated_ids,

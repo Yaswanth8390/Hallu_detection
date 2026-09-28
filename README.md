@@ -1,178 +1,59 @@
-# Token-level semantic evidence and HARP detection
+# Semantic Entropy Probe
 
-This pipeline keeps the existing semantic evidence-span matcher and
-counterfactual `delta_logprob = logP(original) - logP(span-removed)` score,
-then adds token-level HARP features and a supervised Logistic Regression
-classifier. It does not use Jacobian trajectories or a late-layer trajectory
-heuristic.
+An installable package for building semantic-entropy supervision, training a
+linear hidden-state probe, and estimating semantic uncertainty from one
+generated answer. The repository branch contains only this SEP implementation.
 
-## Features and labels
+## Install
 
-One CSV row is emitted per generated content word. The dataset includes the
-requested `token`, `evidence_span`, `counterfactual_score`,
-`semantic_similarity`, `HARP_features`, and `label` columns, plus answer,
-token-offset, and label-source metadata.
-
-HARP features follow the paper's reasoning-subspace projection formulation:
-the output/unembedding weight is decomposed through its hidden-dimension Gram
-matrix; the semantic rank is `k = floor(0.95 * hidden_size)`, and the remaining
-lowest-singular-value right-singular vectors form `V_R`. The unembedding
-Gram matrix is accumulated and diagonalized in CPU float64 to better preserve
-the low-energy directions while avoiding another large GPU allocation. For the causal hidden
-state `h_t` that predicts each generated subtoken, the feature is
-`V_R.T @ h_t`. A content word split into multiple model subtokens receives the
-mean of those per-subtoken projections. The basis is saved to
-`harp_basis.pt` so training and inference use identical coordinates.
-
-Content words are selected with spaCy's POS and entity tags (open-class
-adjectives, adverbs, nouns, proper nouns, numbers, and verbs, plus named-entity
-tokens), not a manually maintained function-word list. The selected semantic
-span and its similarity are evidence-matching features, not entailment checks.
-Likewise, `counterfactual_score` measures input dependence; neither it nor
-semantic similarity by itself determines whether a token is hallucinated.
-The classifier learns from all of these features together with HARP features.
-
-The generated feature CSV includes the old lexical-overlap label for
-inspection, but **the trainer never uses it**. Instead, human answer-level
-labels are provided separately. Annotators see the question and complete
-answer, then label the response `supported` if its material factual claims are
-correct, `hallucinated` if at least one material factual claim is false or
-misleading, or `uncertain` if it cannot be judged. Lack of support in the
-question alone is not proof that a claim is false; use the available factual
-context or references when judging truth. Leave uncertain examples out of
-training.
-
-The trainer uses the answer labels with binary cross-entropy on the maximum
-content-token logit per answer, matching HARP's answer-level max-pooling
-formulation. Validation metrics are answer-level and human-label-based.
-Per-token probabilities are a localization signal learned under answer-level
-supervision, not human token annotations.
-
-## Setup and dataset generation
-
-Install `requirements.txt` and the spaCy English tagger:
-
-```sh
-python -m spacy download en_core_web_sm
-```
-
-Generate features with the configured Qwen model on a GPU:
-
-```sh
-python run_pipeline.py --n 50 --max-new-tokens 32 \
-  --out results_tokens.csv --harp-basis-out harp_basis.pt
-```
-
-By default, model weights are loaded in 8-bit mode. Use `--full-precision` to
-disable it. Use `--content-tagger` to select a different installed spaCy model.
-
-## Train and infer
-
-Launch the interactive review window from the repository folder:
-
-```sh
-streamlit run review_app.py
-```
-
-The app shows each question and complete response, the earlier automatic
-answer/token labels and evidence scores, and lets you mark the response
-`Supported`, `Hallucinated`, or `Abstain`. The answer-level CSV at
-`human_labels.csv` is automatically updated as you annotate; you can also
-download a copy from the app. If you prefer a spreadsheet, export the same
-blank template with:
-
-```sh
-python prepare_annotations.py --data results_tokens.csv --out human_labels.csv
-```
-
-Fill `human_label` with `supported`, `hallucinated`, or `abstain`. Both blank
-and abstain labels are excluded from training. Both supported and hallucinated
-answers are required.
-
-```sh
-python train_detector.py --data results_tokens.csv \
-  --labels human_labels.csv \
-  --harp-basis harp_basis.pt --out token_detector.joblib
-```
-
-Validation splits are stratified by answer and use only human labels. Reported
-accuracy, F1, and ROC-AUC are answer-level metrics; the final saved estimator
-is then fit on all human-labeled answers.
-
-Generate a full sentence and receive per-content-token hallucination
-probabilities. The response text remains intact; only its individual content
-tokens receive flags.
-
-```sh
-python infer.py --question "Who wrote 1984?" \
-  --detector token_detector.joblib --threshold 0.5
-```
-
-The detector threshold defaults to `0.5`, matching the paper's binary
-threshold convention. It can be changed with `--threshold`.
-
-## Semantic Entropy Probes (SEP)
-
-SEP now lives in the installable `semantic_entropy_probe` Python package, with
-separate dataset-building, training, and inference entry points. It is an
-answer-level uncertainty detector and does not replace the token-level HARP
-pipeline above. Dataset building samples
-multiple answers per question, scores each answer under the untempered model
-distribution, groups mutually entailing answers with an NLI model, and computes
-the entropy of the resulting semantic-cluster probability masses. For each
-question it also stores the mean final-layer causal hidden state from one
-sampled answer. Training fits a Ridge linear probe to predict that semantic
-entropy. At inference, the probe reads hidden states from one generated answer,
-so it does not need multiple generations or an NLI model at deployment.
-
-Install the package and its dependencies in the active environment:
+Use Python 3.10+ and install the package and dependencies:
 
 ```sh
 python -m pip install -e .
 ```
 
-Build the entropy-supervised dataset (the default NLI model is downloaded from
-Hugging Face on first use):
+## Build an entropy-labeled dataset
+
+The default dataset is TruthfulQA generation validation. Each question is
+answered multiple times; an NLI model groups mutually entailing answers, and
+the probability masses of those semantic clusters produce an entropy target.
+No manual hallucination labels are needed for this training target.
 
 ```sh
 sep-build-dataset --n 100 --num-samples 10 \
   --out sep_dataset.csv --device cuda --nli-device cuda
 ```
 
-Train and validate the linear probe:
+Dataset construction downloads the configured answer model, NLI model, and
+TruthfulQA data when they are not already cached. Use `--split`, `--nli-model`,
+`--temperature`, and `--top-p` to configure data generation.
+
+## Train the probe
 
 ```sh
 sep-train --data sep_dataset.csv --out sep_probe.joblib
 ```
 
-Run single-generation inference. The default alert threshold is the 75th
-percentile of the training-set entropy targets; override it in nats as needed:
+Training reports held-out mean absolute and root mean squared semantic-entropy
+errors, then fits the saved probe on the full dataset. The default uncertainty
+alert threshold is the 75th percentile of training entropy targets.
+
+## Single-answer inference
 
 ```sh
 sep-infer --question "Who wrote 1984?" --probe sep_probe.joblib
-sep-infer --question "Who wrote 1984?" --probe sep_probe.joblib \
-  --threshold 0.5
 ```
 
-SEP estimates semantic uncertainty, which can be useful as a hallucination
-signal but is not itself a factuality judgment. The probe needs representative
-sampled generations and NLI quality during dataset construction; review its
-held-out entropy regression error and calibrate its alert threshold for the
-intended deployment domain. The SEP smoke test can be run with:
+Inference generates one answer and predicts its semantic entropy without
+sampling multiple answers or loading the NLI model. An explicit threshold in
+nats can be set with `--threshold`.
+
+Semantic entropy is an uncertainty signal, not a factuality judgment. Validate
+the probe and calibrate alert thresholds against representative data before
+using alerts to make factuality decisions.
+
+## Test
 
 ```sh
-PYTHONPATH=. python tests/test_semantic_entropy_probe.py
-```
-
-## Smoke tests
-
-The tests use small randomly initialized models and test token alignment,
-semantic matching, and counterfactual log-probabilities without downloading
-the target model:
-
-```sh
-python tests/smoke_test.py
-python tests/smoke_test_multitoken.py
-python tests/smoke_test_training.py
-python tests/smoke_test_review_app.py
+python tests/test_semantic_entropy_probe.py
 ```
