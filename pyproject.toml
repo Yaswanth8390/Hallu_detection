@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "halludetection-semantic-entropy-probe"
+version = "0.1.0"
+description = "Semantic Entropy Probe pipeline for hallucination uncertainty detection"
+requires-python = ">=3.10"
+dependencies = [
+    "accelerate>=0.30",
+    "bitsandbytes>=0.43",
+    "datasets>=2.19",
+    "joblib>=1.3",
+    "numpy>=1.24",
+    "scikit-learn>=1.3",
+    "torch>=2.1",
+    "transformers>=4.45",
+]
+
+[project.scripts]
+sep-build-dataset = "semantic_entropy_probe.build_dataset:main"
+sep-train = "semantic_entropy_probe.probe:main"
+sep-infer = "semantic_entropy_probe.inference:main"
+
+[tool.setuptools]
+packages = ["semantic_entropy_probe"]
+py-modules = ["dataset", "jacobian", "model_utils"]

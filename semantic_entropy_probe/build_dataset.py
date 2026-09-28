@@ -10,7 +10,7 @@ import torch
 
 from dataset import load_truthfulqa
 from model_utils import MODEL_NAME, input_device, load_model
-from semantic_entropy import (
+from .entropy import (
     NLIEntailment,
     extract_response_representation,
     semantic_entropy,

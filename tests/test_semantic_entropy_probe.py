@@ -10,12 +10,12 @@ import torch
 from transformers import AutoModelForCausalLM, Qwen2Config
 
 from model_utils import MODEL_NAME
-from semantic_entropy import (
+from semantic_entropy_probe.entropy import (
     extract_response_representation,
     semantic_entropy,
     semantic_entropy_from_clusters,
 )
-from train_sep_probe import train_probe
+from semantic_entropy_probe.probe import train_probe
 
 
 responses = ["Paris", "The answer is Paris.", "Rome", "Rome"]

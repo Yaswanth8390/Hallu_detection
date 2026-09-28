@@ -1,4 +1,4 @@
-"""Train a linear hidden-state probe to predict semantic entropy."""
+"""Train and validate a linear hidden-state probe for semantic entropy."""
 
 import argparse
 import csv

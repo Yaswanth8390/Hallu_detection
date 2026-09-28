@@ -6,7 +6,7 @@ import json
 import joblib
 
 from model_utils import MODEL_NAME, generate_answer, load_model
-from semantic_entropy import extract_response_representation
+from .entropy import extract_response_representation
 
 
 def main():

@@ -113,8 +113,10 @@ threshold convention. It can be changed with `--threshold`.
 
 ## Semantic Entropy Probes (SEP)
 
-The SEP implementation is a separate answer-level uncertainty detector; it
-does not replace the token-level HARP pipeline above. Dataset building samples
+SEP now lives in the installable `semantic_entropy_probe` Python package, with
+separate dataset-building, training, and inference entry points. It is an
+answer-level uncertainty detector and does not replace the token-level HARP
+pipeline above. Dataset building samples
 multiple answers per question, scores each answer under the untempered model
 distribution, groups mutually entailing answers with an NLI model, and computes
 the entropy of the resulting semantic-cluster probability masses. For each
@@ -123,26 +125,32 @@ sampled answer. Training fits a Ridge linear probe to predict that semantic
 entropy. At inference, the probe reads hidden states from one generated answer,
 so it does not need multiple generations or an NLI model at deployment.
 
+Install the package and its dependencies in the active environment:
+
+```sh
+python -m pip install -e .
+```
+
 Build the entropy-supervised dataset (the default NLI model is downloaded from
 Hugging Face on first use):
 
 ```sh
-python build_sep_dataset.py --n 100 --num-samples 10 \
+sep-build-dataset --n 100 --num-samples 10 \
   --out sep_dataset.csv --device cuda --nli-device cuda
 ```
 
 Train and validate the linear probe:
 
 ```sh
-python train_sep_probe.py --data sep_dataset.csv --out sep_probe.joblib
+sep-train --data sep_dataset.csv --out sep_probe.joblib
 ```
 
 Run single-generation inference. The default alert threshold is the 75th
 percentile of the training-set entropy targets; override it in nats as needed:
 
 ```sh
-python infer_sep.py --question "Who wrote 1984?" --probe sep_probe.joblib
-python infer_sep.py --question "Who wrote 1984?" --probe sep_probe.joblib \
+sep-infer --question "Who wrote 1984?" --probe sep_probe.joblib
+sep-infer --question "Who wrote 1984?" --probe sep_probe.joblib \
   --threshold 0.5
 ```
 
@@ -153,7 +161,7 @@ held-out entropy regression error and calibrate its alert threshold for the
 intended deployment domain. The SEP smoke test can be run with:
 
 ```sh
-python tests/smoke_test_sep.py
+PYTHONPATH=. python tests/test_semantic_entropy_probe.py
 ```
 
 ## Smoke tests

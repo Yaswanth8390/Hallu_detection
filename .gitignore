@@ -1,1 +1,4 @@
 __pycache__/
+*.egg-info/
+/sep_dataset.csv
+/sep_probe.joblib
